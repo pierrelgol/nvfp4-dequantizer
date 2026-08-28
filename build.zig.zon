@@ -1,0 +1,13 @@
+.{
+    .name = .nvfp4_dequantizer,
+    .version = "0.0.0",
+    .fingerprint = 0xa52332dd58eccbf,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
