@@ -11,7 +11,15 @@ const process = std.process;
 pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const io = init.io;
-
-    _ = allocator;
     _ = io;
+
+    var args = init.minimal.args.iterateAllocator(allocator) catch |err| {
+        log.err("Fatal : {}", .{err});
+        return @intFromError(err);
+    };
+    _ = args.skip();
+
+    std.debug.print("{s}", .{args.next().?});
+
+    return 0;
 }
