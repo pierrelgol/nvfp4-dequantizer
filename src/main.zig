@@ -7,19 +7,24 @@ const log = std.log;
 const ascii = std.ascii;
 const Io = std.Io;
 const process = std.process;
+const Args = @import("Args.zig");
 
-pub fn main(init: std.process.Init) !u8 {
+pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
     _ = io;
 
-    var args = init.minimal.args.iterateAllocator(allocator) catch |err| {
+    var it = init.minimal.args.iterateAllocator(allocator) catch |err| {
         log.err("Fatal : {}", .{err});
-        return @intFromError(err);
+        return;
     };
-    _ = args.skip();
+    _ = it.skip();
 
-    std.debug.print("{s}", .{args.next().?});
+    var args = Args.parseArgs(&it) catch |err| {
+        log.err("Fatal : {}", .{err});
+        return;
+    };
+    _ = &args;
 
-    return 0;
+    std.debug.print("{f}", .{args});
 }

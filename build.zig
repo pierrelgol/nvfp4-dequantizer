@@ -21,7 +21,13 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);
+    run_cmd.addArg("-i");
     run_cmd.addFileArg2(b.path("models/gemma-3-270m-it-NVFP4/model.safetensors"), .{ .make_absolute = true });
+    run_cmd.addArg("-f");
+    run_cmd.addArg("f32");
+    run_cmd.addArg("-o");
+    run_cmd.addFileArg2(b.path("models/gemma-3-270m-it-NVFP4/model.f32"), .{ .make_absolute = true });
+
     run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 
