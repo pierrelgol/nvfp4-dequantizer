@@ -8,11 +8,12 @@ const ascii = std.ascii;
 const Io = std.Io;
 const process = std.process;
 const Args = @import("Args.zig");
+const Safetensors = @import("Safetensors.zig");
+const builtin = @import("builtin");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
-    _ = io;
 
     var it = init.minimal.args.iterateAllocator(allocator) catch |err| {
         log.err("Fatal : {}", .{err});
@@ -20,11 +21,34 @@ pub fn main(init: std.process.Init) !void {
     };
     _ = it.skip();
 
-    var args = Args.parseArgs(&it) catch |err| {
+    const args = Args.parseArgs(&it) catch |err| {
         log.err("Fatal : {}", .{err});
         return;
     };
-    _ = &args;
 
-    std.debug.print("{f}", .{args});
+    const file = Io.Dir.cwd().openFile(io, args.input, .{}) catch |err| {
+        log.err("Fatal : {}", .{err});
+        return;
+    };
+    defer file.close(io);
+
+    // const file_stats = file.stat(io) catch |err| {
+    //     log.err("Fatal : {}", .{err});
+    //     return;
+    // };
+
+    var file_reader_buffer: [std.heap.pageSize()]u8 = undefined;
+    var file_reader: Io.File.Reader = .init(file, io, &file_reader_buffer);
+    const reader: *Io.Reader = &file_reader.interface;
+
+    var stdout_writer_buffer: [std.heap.pageSize()]u8 = undefined;
+    var stdout_writer: Io.File.Writer = Io.File.stdout().writerStreaming(io, &stdout_writer_buffer);
+    const stdout: *Io.Writer = &stdout_writer.interface;
+
+    var tensor: Safetensors = .init();
+    try tensor.loadSafetensors(reader, allocator);
+    defer tensor.deinit();
+
+    try stdout.print("{f}\n", .{tensor});
+    try stdout.flush();
 }
