@@ -9,6 +9,7 @@ const Io = std.Io;
 const process = std.process;
 const Args = @import("Args.zig");
 const Safetensors = @import("Safetensors.zig");
+const TensorLoader = @import("TensorLoader.zig");
 const builtin = @import("builtin");
 
 pub fn main(init: std.process.Init) !void {
@@ -32,31 +33,41 @@ pub fn main(init: std.process.Init) !void {
     };
     defer file.close(io);
 
-    // const file_stats = file.stat(io) catch |err| {
-    //     log.err("Fatal : {}", .{err});
-    //     return;
-    // };
-
     var file_reader_buffer: [std.heap.pageSize()]u8 = undefined;
     var file_reader: Io.File.Reader = .init(file, io, &file_reader_buffer);
     const reader: *Io.Reader = &file_reader.interface;
 
-    // var stdout_writer_buffer: [std.heap.pageSize()]u8 = undefined;
-    // var stdout_writer: Io.File.Writer = Io.File.stdout().writerStreaming(io, &stdout_writer_buffer);
-    // const stdout: *Io.Writer = &stdout_writer.interface;
+    var stdout_writer_buffer: [std.heap.pageSize()]u8 = undefined;
+    var stdout_writer: Io.File.Writer = Io.File.stdout().writerStreaming(io, &stdout_writer_buffer);
+    const stdout: *Io.Writer = &stdout_writer.interface;
 
-    var tensor_output_queue_buffer: [32]Safetensors.TensorMetaData = undefined;
-    var tensor_output_queue: Io.Queue(Safetensors.TensorMetaData) = .init(&tensor_output_queue_buffer);
-    defer tensor_output_queue.close(io);
+    const arena = init.arena.allocator();
+    const tensor_metadata = try Safetensors.parseSafetensorHeader(arena, reader);
 
-    var tensor: Safetensors = .init(allocator, &tensor_output_queue);
-    defer tensor.deinit();
+    var job_queue_buffer: [32]TensorLoader.QuantizedWeights = undefined;
+    var job_queue: Io.Queue(TensorLoader.QuantizedWeights) = .init(&job_queue_buffer);
 
-    try tensor.decodeJsonHeaderSize(reader);
-    var future = try io.concurrent(Safetensors.parseSafetensorHeader, .{ &tensor, io, reader });
-    defer {
-        if (future.cancel(io)) |_| {} else |err| {
-            log.err("Fatal : {}\n", .{err});
-        }
+    var tensor_loader: TensorLoader = .init(allocator, &job_queue);
+    var loader = try io.concurrent(TensorLoader.run, .{ &tensor_loader, io, tensor_metadata });
+
+    while (true) {
+        const job = job_queue.getOne(io) catch |err| switch (err) {
+            error.Closed => break,
+            else => return err,
+        };
+
+        try stdout.print(
+            "job {d}: {s}, scale={}, global_scale={}, input_scale={}\n",
+            .{
+                job.id,
+                job.weight.name,
+                job.weight_scale != null,
+                job.weight_global_scale != null,
+                job.input_global_scale != null,
+            },
+        );
     }
+
+    try loader.await(io);
+    try stdout.flush();
 }

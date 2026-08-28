@@ -7,35 +7,19 @@ const log = std.log;
 const ascii = std.ascii;
 const Io = std.Io;
 const process = std.process;
-pub const Safetensors = @This();
 pub const json = std.json;
-
-header_size: JsonHeader = undefined,
-raw_header_arena: heap.ArenaAllocator, // bit of a lazy solution because this means memory usage will max 100MB
-output: *Io.Queue(Safetensors.TensorMetaData),
 
 pub const Error = error{
     HeaderTooLarge,
     SomeTingWong, // TODO replace placeholder
 };
 
-pub fn init(allocator: mem.Allocator, output: *Io.Queue(Safetensors.TensorMetaData)) Safetensors {
-    return .{
-        .header_size = undefined,
-        .raw_header_arena = .init(allocator),
-        .output = output,
-    };
-}
+pub fn parseSafetensorHeader(allocator: mem.Allocator, reader: *Io.Reader) ![]TensorMetaData {
+    const header_size = try decodeJsonHeaderSize(reader);
+    var list: std.ArrayListUnmanaged(TensorMetaData) = .empty;
 
-pub fn deinit(self: *Safetensors) void {
-    defer self.* = undefined;
-    self.raw_header_arena.deinit();
-}
-
-pub fn parseSafetensorHeader(self: *Safetensors, io: std.Io, reader: *Io.Reader) !void {
-    const allocator = self.raw_header_arena.allocator();
     var limited_buffer: [std.heap.pageSize()]u8 = undefined;
-    var limited = reader.limited(.limited(@intCast(self.header_size)), &limited_buffer);
+    var limited = reader.limited(.limited(@intCast(header_size)), &limited_buffer);
 
     var json_reader: std.json.Reader = .init(allocator, &limited.interface);
     defer json_reader.deinit();
@@ -58,7 +42,10 @@ pub fn parseSafetensorHeader(self: *Safetensors, io: std.Io, reader: *Io.Reader)
             continue;
         }
 
-        const token = try std.json.parseFromTokenSourceLeaky(RawMetaData, allocator, &json_reader, .{});
+        const token = try std.json.innerParse(RawMetaData, allocator, &json_reader, .{
+            .allocate = .alloc_always,
+            .max_value_len = std.json.default_max_value_len,
+        });
 
         if (token.data_offsets[0] > token.data_offsets[1]) {
             return error.SomeTingWong;
@@ -71,20 +58,25 @@ pub fn parseSafetensorHeader(self: *Safetensors, io: std.Io, reader: *Io.Reader)
                 .relative_end = token.data_offsets[1],
             };
 
-            try self.output.putOne(io, metadata);
-        }
-
-        if (try json_reader.next() != .end_of_document) {
-            return error.SomeTingWong;
+            try list.append(allocator, metadata);
         }
     }
+
+    if (try json_reader.next() != .end_of_document) {
+        return error.SomeTingWong;
+    }
+
+    return try list.toOwnedSlice(allocator);
 }
 
-pub fn decodeJsonHeaderSize(self: *Safetensors, reader: *Io.Reader) !void {
-    self.header_size = try reader.takeInt(JsonHeader, std.lang.Endian.little); // TODO look on google wether safetensor is always little endian
-    if (self.header_size > (100 * 1024 * 1024)) { // 100MB according to https://www.datacamp.com/blog/safetensors-format
+fn decodeJsonHeaderSize(reader: *Io.Reader) !u64 {
+    const header_size = try reader.takeInt(JsonHeader, std.lang.Endian.little); // TODO look on google wether safetensor is always little endian
+
+    if (header_size > (100 * 1024 * 1024)) { // 100MB according to https://www.datacamp.com/blog/safetensors-format
         return error.HeaderTooLarge;
     }
+
+    return header_size;
 }
 
 pub fn format(
