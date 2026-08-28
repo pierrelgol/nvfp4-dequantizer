@@ -7,7 +7,7 @@ const log = std.log;
 const ascii = std.ascii;
 const Io = std.Io;
 const process = std.process;
-pub const json = std.json;
+const json = std.json;
 
 pub const Error = error{
     HeaderTooLarge,
@@ -116,10 +116,6 @@ pub const RawMetaData = struct {
     dtype: DType,
     shape: []const u64,
     data_offsets: [2]u64,
-
-    pub const View = struct {
-        bytes: []align(1) const u8,
-    };
 };
 
 pub const TensorMetaData = struct {
@@ -128,10 +124,6 @@ pub const TensorMetaData = struct {
     shape: []const u64,
     relative_start: u64,
     relative_end: u64,
-
-    pub const View = struct {
-        bytes: []align(1) const u8,
-    };
 };
 
 /// 8 bytes according to https://www.datacamp.com/blog/safetensors-format
