@@ -9,7 +9,6 @@ const Io = std.Io;
 const process = std.process;
 const Args = @import("Args.zig");
 const Safetensors = @import("Safetensors.zig");
-const TensorLoader = @import("TensorLoader.zig");
 const builtin = @import("builtin");
 
 pub fn main(init: std.process.Init) !void {
@@ -43,31 +42,7 @@ pub fn main(init: std.process.Init) !void {
 
     const arena = init.arena.allocator();
     const tensor_metadata = try Safetensors.parseSafetensorHeader(arena, reader);
+    _ = tensor_metadata;
 
-    var job_queue_buffer: [32]TensorLoader.QuantizedWeights = undefined;
-    var job_queue: Io.Queue(TensorLoader.QuantizedWeights) = .init(&job_queue_buffer);
-
-    var tensor_loader: TensorLoader = .init(allocator, &job_queue);
-    var loader = try io.concurrent(TensorLoader.run, .{ &tensor_loader, io, tensor_metadata });
-
-    while (true) {
-        const job = job_queue.getOne(io) catch |err| switch (err) {
-            error.Closed => break,
-            else => return err,
-        };
-
-        try stdout.print(
-            "job {d}: {s}, scale={}, global_scale={}, input_scale={}\n",
-            .{
-                job.id,
-                job.weight.name,
-                job.weight_scale != null,
-                job.weight_global_scale != null,
-                job.input_global_scale != null,
-            },
-        );
-    }
-
-    try loader.await(io);
     try stdout.flush();
 }
