@@ -41,14 +41,22 @@ pub fn main(init: std.process.Init) !void {
     var file_reader: Io.File.Reader = .init(file, io, &file_reader_buffer);
     const reader: *Io.Reader = &file_reader.interface;
 
-    var stdout_writer_buffer: [std.heap.pageSize()]u8 = undefined;
-    var stdout_writer: Io.File.Writer = Io.File.stdout().writerStreaming(io, &stdout_writer_buffer);
-    const stdout: *Io.Writer = &stdout_writer.interface;
+    // var stdout_writer_buffer: [std.heap.pageSize()]u8 = undefined;
+    // var stdout_writer: Io.File.Writer = Io.File.stdout().writerStreaming(io, &stdout_writer_buffer);
+    // const stdout: *Io.Writer = &stdout_writer.interface;
 
-    var tensor: Safetensors = .init();
-    try tensor.loadSafetensors(reader, allocator);
+    var tensor_output_queue_buffer: [32]Safetensors.TensorMetaData = undefined;
+    var tensor_output_queue: Io.Queue(Safetensors.TensorMetaData) = .init(&tensor_output_queue_buffer);
+    defer tensor_output_queue.close(io);
+
+    var tensor: Safetensors = .init(allocator, &tensor_output_queue);
     defer tensor.deinit();
 
-    try stdout.print("{f}\n", .{tensor});
-    try stdout.flush();
+    try tensor.decodeJsonHeaderSize(reader);
+    var future = try io.concurrent(Safetensors.parseSafetensorHeader, .{ &tensor, io, reader });
+    defer {
+        if (future.cancel(io)) |_| {} else |err| {
+            log.err("Fatal : {}\n", .{err});
+        }
+    }
 }

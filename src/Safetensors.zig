@@ -11,42 +11,80 @@ pub const Safetensors = @This();
 pub const json = std.json;
 
 header_size: JsonHeader = undefined,
-header_json: ?std.json.Parsed(std.json.Value) = null,
+raw_header_arena: heap.ArenaAllocator, // bit of a lazy solution because this means memory usage will max 100MB
+output: *Io.Queue(Safetensors.TensorMetaData),
 
 pub const Error = error{
     HeaderTooLarge,
+    SomeTingWong, // TODO replace placeholder
 };
 
-pub fn init() Safetensors {
+pub fn init(allocator: mem.Allocator, output: *Io.Queue(Safetensors.TensorMetaData)) Safetensors {
     return .{
         .header_size = undefined,
-        .header_json = null,
+        .raw_header_arena = .init(allocator),
+        .output = output,
     };
 }
 
 pub fn deinit(self: *Safetensors) void {
     defer self.* = undefined;
-    if (self.header_json) |some| {
-        some.deinit();
+    self.raw_header_arena.deinit();
+}
+
+pub fn parseSafetensorHeader(self: *Safetensors, io: std.Io, reader: *Io.Reader) !void {
+    const allocator = self.raw_header_arena.allocator();
+    var limited_buffer: [std.heap.pageSize()]u8 = undefined;
+    var limited = reader.limited(.limited(@intCast(self.header_size)), &limited_buffer);
+
+    var json_reader: std.json.Reader = .init(allocator, &limited.interface);
+    defer json_reader.deinit();
+
+    if (try json_reader.next() != .object_begin) {
+        return error.SomeTingWong;
+    }
+
+    while (true) {
+        const entry = try json_reader.nextAlloc(allocator, .alloc_always);
+
+        const name = switch (entry) {
+            .allocated_string => |value| value,
+            .object_end => break,
+            else => return error.SomeTingWong,
+        };
+
+        if (mem.eql(u8, "__metadata__", name)) {
+            try json_reader.skipValue();
+            continue;
+        }
+
+        const token = try std.json.parseFromTokenSourceLeaky(RawMetaData, allocator, &json_reader, .{});
+
+        if (token.data_offsets[0] > token.data_offsets[1]) {
+            return error.SomeTingWong;
+        } else {
+            const metadata: TensorMetaData = .{
+                .name = name,
+                .dtype = token.dtype,
+                .shape = token.shape,
+                .relative_start = token.data_offsets[0],
+                .relative_end = token.data_offsets[1],
+            };
+
+            try self.output.putOne(io, metadata);
+        }
+
+        if (try json_reader.next() != .end_of_document) {
+            return error.SomeTingWong;
+        }
     }
 }
 
-pub fn loadSafetensors(self: *Safetensors, reader: *Io.Reader, allocator: mem.Allocator) !void {
-    try self.decodeJsonHeaderSize(reader);
-    try self.decodeJsonHeader(allocator, reader);
-}
-
-fn decodeJsonHeaderSize(self: *Safetensors, reader: *Io.Reader) !void {
+pub fn decodeJsonHeaderSize(self: *Safetensors, reader: *Io.Reader) !void {
     self.header_size = try reader.takeInt(JsonHeader, std.lang.Endian.little); // TODO look on google wether safetensor is always little endian
     if (self.header_size > (100 * 1024 * 1024)) { // 100MB according to https://www.datacamp.com/blog/safetensors-format
         return error.HeaderTooLarge;
     }
-}
-
-fn decodeJsonHeader(self: *Safetensors, allocator: mem.Allocator, reader: *Io.Reader) !void {
-    const json_header_slice = try reader.readAlloc(allocator, self.header_size);
-    defer allocator.free(json_header_slice);
-    self.header_json = try std.json.parseFromSlice(std.json.Value, allocator, json_header_slice, .{});
 }
 
 pub fn format(
@@ -82,6 +120,16 @@ pub const DType = enum {
     F64,
 };
 
+pub const RawMetaData = struct {
+    dtype: DType,
+    shape: []const u64,
+    data_offsets: [2]u64,
+
+    pub const View = struct {
+        bytes: []align(1) const u8,
+    };
+};
+
 pub const TensorMetaData = struct {
     name: []const u8,
     dtype: DType,
@@ -95,4 +143,4 @@ pub const TensorMetaData = struct {
 };
 
 /// 8 bytes according to https://www.datacamp.com/blog/safetensors-format
-pub const JsonHeader = u64;
+pub const JsonHeader = u64; // TODO need to find a better name
