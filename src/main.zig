@@ -10,6 +10,7 @@ const process = std.process;
 const Args = @import("Args.zig");
 const Safetensors = @import("Safetensors.zig");
 const TensorBuilder = @import("TensorBuilder.zig");
+const Dequantizer = @import("Dequantizer.zig");
 const builtin = @import("builtin");
 
 pub fn main(init: std.process.Init) !void {
@@ -54,18 +55,34 @@ pub fn main(init: std.process.Init) !void {
     var tensor_builder_future = try io.concurrent(TensorBuilder.run, .{ &tensor_builder, io });
     defer tensor_builder_future.cancel(io) catch {};
 
+    var dequantizer_output_queue_buffer: [32]Dequantizer.DecodedBlock = undefined;
+    var dequantizer_output_queue: Io.Queue(Dequantizer.DecodedBlock) = .init(&dequantizer_output_queue_buffer);
+
+    var dequantizer: Dequantizer = .init(
+        allocator,
+        io,
+        &file_reader,
+        @intCast(parsedTensorMetadata.positionnal_binary_data_start),
+        &tensor_builder_output_queue,
+        &dequantizer_output_queue,
+    );
+
+    var dequantizer_future = try io.concurrent(Dequantizer.run, .{&dequantizer});
+    defer dequantizer_future.cancel(io) catch {};
+
+    var decoded_block_count: usize = 0;
     while (true) {
-        const item = tensor_builder_output_queue.getOne(io) catch |err| {
-            switch (err) {
-                error.Closed => {
-                    log.info("done", .{});
-                    return;
-                },
-                else => return err,
-            }
+        _ = dequantizer_output_queue.getOne(io) catch |err| switch (err) {
+            error.Closed => break,
+            error.Canceled => return err,
         };
-        _ = item;
+        decoded_block_count += 1;
     }
+
+    try dequantizer_future.await(io);
+    try tensor_builder_future.await(io);
+
+    log.info("total blocks {d} Nfvp4 -> f32", .{decoded_block_count});
 
     try stdout.flush();
 }
