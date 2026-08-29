@@ -53,16 +53,12 @@ fn dequantizeWeight(self: *Dequantizer, weight: TensorBuilder.QuantizedWeight) !
     const quantized_weights_size = try tensorTotalByteSize(weight.weights);
     const quantized_scale_size = try tensorTotalByteSize(weight.scale);
     const quantized_block_size: u64 = @sizeOf(Nvfp4.PackedWeights);
-    std.debug.print("quantized_wieght_size {d}\n", .{quantized_weights_size});
-    std.debug.print("quantized_scale_size {d}\n", .{quantized_scale_size});
-    std.debug.print("quantized_block_size {d}\n", .{quantized_block_size});
 
-    if (quantized_weights_size / quantized_block_size != 0) {
+    if (quantized_weights_size % quantized_block_size != 0) {
         return error.SomeTingWong;
     }
 
     const block_count: u64 = quantized_weights_size / quantized_block_size;
-    std.debug.print("block_count {d}\n", .{block_count});
 
     if (block_count != quantized_scale_size) {
         return error.SomTingWong;
