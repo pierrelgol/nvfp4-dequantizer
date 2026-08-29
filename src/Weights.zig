@@ -9,6 +9,7 @@ const process = std.process;
 const log = std.log;
 const Cli = @import("Cli.zig");
 const safetensors = @import("safetensors.zig");
+const quantization = @import("quantization.zig");
 pub const Weights = @This();
 
 const packed_suffix = ".weight_packed";
@@ -20,12 +21,14 @@ pub const TensorIndex = usize;
 pub const TensorMap = std.StringArrayHashMapUnmanaged(TensorIndex);
 
 tensors_index: std.StringArrayHashMapUnmanaged(TensorIndex) = .empty,
-weigths: std.MultiArrayList(Nvfp4Weight),
+weigths: std.MultiArrayList(Nvfp4Weight) = .empty,
+steps: []Step,
 
 pub fn init() Weights {
     return .{
         .tensors_index = .empty,
         .weigths = .empty,
+        .steps = &.{},
     };
 }
 
@@ -33,6 +36,7 @@ pub fn deinit(self: *Weights, allocator: mem.Allocator) void {
     defer self.* = undefined;
     self.tensors_index.deinit(allocator);
     self.weigths.deinit(allocator);
+    allocator.free(self.steps);
 }
 
 pub fn buildTensorMap(self: *Weights, allocator: mem.Allocator, parsed_tensors: *const std.MultiArrayList(safetensors.MetaData)) !void {
@@ -80,6 +84,64 @@ pub fn buildNvfp4WeightsIndex(self: *Weights, allocator: mem.Allocator, names: [
             .global_scale = global_scale_index,
         });
     }
+}
+
+pub const Step = union(enum) {
+    copy,
+    cache_local_scale: usize,
+    cache_global_scale: usize,
+    dequantize: usize,
+};
+
+pub fn buildDispatchList(self: *Weights, allocator: mem.Allocator, tensor_count: usize) !void {
+    const nvfp4_weights = self.weigths.slice();
+    const quantized_blocks = nvfp4_weights.items(.quantized_block);
+    const local_scales = nvfp4_weights.items(.local_scale);
+    const global_scales = nvfp4_weights.items(.global_scale);
+
+    const steps = try allocator.alloc(Step, tensor_count);
+    errdefer allocator.free(steps);
+    @memset(steps, .copy);
+
+    for (local_scales, 0..) |tensor_index, weight_index| {
+        try setStepAtIndex(
+            steps,
+            tensor_index,
+            .{
+                .cache_local_scale = weight_index,
+            },
+        );
+    }
+
+    for (global_scales, 0..) |tensor_index, weight_index| {
+        try setStepAtIndex(
+            steps,
+            tensor_index,
+            .{
+                .cache_global_scale = weight_index,
+            },
+        );
+    }
+
+    for (quantized_blocks, 0..) |tensor_index, weight_index| {
+        try setStepAtIndex(
+            steps,
+            tensor_index,
+            .{
+                .dequantize = weight_index,
+            },
+        );
+    }
+    self.steps = steps;
+}
+
+fn setStepAtIndex(steps: []Step, index: usize, step: Step) !void {
+    std.debug.assert(index < steps.len);
+
+    return switch (steps[index]) {
+        .copy => steps[index] = step,
+        else => unreachable, // TODO ensure this never exist,
+    };
 }
 
 pub const Nvfp4Weight = struct {
