@@ -50,15 +50,15 @@ pub fn run(self: *TensorBuilder, io: std.Io) !void {
                 .id = i,
                 .name = w.name,
                 .weights = w,
-                .scale = findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".weight_scale"),
-                .global_scale = findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".weight_global_scale"),
-                .global_input_scale = findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".input_global_scale"),
+                .scale = try findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".weight_scale"),
+                .global_scale = try findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".weight_global_scale"),
+                .global_input_scale = try findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".input_global_scale"),
             });
         }
     }
 }
 
-fn findWholeQuantizedWeights(tensor_metadata: []Safetensors.TensorMetaData, base: []const u8, suffix: []const u8) ?Safetensors.TensorMetaData {
+fn findWholeQuantizedWeights(tensor_metadata: []Safetensors.TensorMetaData, base: []const u8, suffix: []const u8) !Safetensors.TensorMetaData {
     // TODO look if all the tensor metadata are always in order in the json or not, since we could have a more efficient for loop if we could just pass
     // tensor_metadata[last_iteration_index..] instead of the whole slice.
     const total_len_of_base_plus_suffix = base.len + suffix.len;
@@ -76,7 +76,7 @@ fn findWholeQuantizedWeights(tensor_metadata: []Safetensors.TensorMetaData, base
         }
 
         break maybe_result;
-    } else null;
+    } else error.InvalidTensorMetadata;
 }
 
 // fn weightBasename(slice: []const u8, sep: u8) ?[]const u8 {
@@ -93,13 +93,9 @@ fn weightName(slice: []const u8, sep: u8) ?[]const u8 {
 /// dequantizable unit of concurrency
 pub const QuantizedWeight = struct {
     id: usize,
-    name: ?[]const u8 = null,
-    weights: ?Safetensors.TensorMetaData = null,
-    scale: ?Safetensors.TensorMetaData = null,
-    global_scale: ?Safetensors.TensorMetaData = null,
-    global_input_scale: ?Safetensors.TensorMetaData = null,
-
-    pub fn isComplete(self: *const QuantizedWeight) bool {
-        return if (self.name != null and self.weights != null and self.scale != null and self.global_scale != null and self.global_input_scale != null) true else false;
-    }
+    name: []const u8,
+    weights: Safetensors.TensorMetaData,
+    scale: Safetensors.TensorMetaData,
+    global_scale: Safetensors.TensorMetaData,
+    global_input_scale: Safetensors.TensorMetaData,
 };

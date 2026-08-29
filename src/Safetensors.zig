@@ -27,7 +27,7 @@ pub const Error = error{
 //
 
 pub const ParsedTensorMetadata = struct {
-    tensors: TensorMetaData,
+    tensors: []TensorMetaData,
     positionnal_binary_data_start: usize,
 };
 
@@ -90,7 +90,8 @@ pub fn parseSafetensorHeader(allocator: mem.Allocator, reader: *Io.Reader) !Pars
         return error.SomeTingWong;
     }
 
-    return try list.toOwnedSlice(allocator);
+    result.tensors = try list.toOwnedSlice(allocator);
+    return result;
 }
 
 fn decodeJsonHeaderSize(reader: *Io.Reader) !u64 {
