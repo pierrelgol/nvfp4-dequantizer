@@ -4,12 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const debug_options = b.option(bool, "debug", "enables debug printf") orelse false;
+    const options = b.addOptions();
+    options.addOption(bool, "debug", debug_options);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .optimize = optimize,
         .target = target,
         .imports = &.{},
     });
+    exe_mod.addOptions("options", options);
 
     const exe = b.addExecutable(.{
         .name = "nvfp4_dequantizer",
@@ -21,12 +26,14 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.addArg("-i");
+    run_cmd.addArg("--input");
     run_cmd.addFileArg2(b.path("models/gemma-3-270m-it-NVFP4/model.safetensors"), .{ .make_absolute = true });
-    run_cmd.addArg("-f");
+    run_cmd.addArg("--input-fmt");
+    run_cmd.addArg("nvfp4");
+    run_cmd.addArg("--output");
+    run_cmd.addFileArg2(b.path("models/gemma-3-270m-it-NVFP4/model.f32.safetensors"), .{ .make_absolute = true });
+    run_cmd.addArg("--output-fmt");
     run_cmd.addArg("f32");
-    run_cmd.addArg("-o");
-    run_cmd.addFileArg2(b.path("models/gemma-3-270m-it-NVFP4/model.f32"), .{ .make_absolute = true });
 
     run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
