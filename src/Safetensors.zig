@@ -116,6 +116,40 @@ pub fn format(
     }
 }
 
+fn stringifyHeader(tensor_metadata: []const TensorMetaData, writer: *Io.Writer) Io.Writer.Error!void {
+    var stringify: std.json.Stringify = .{
+        .writer = writer,
+        .options = .{ .whitespace = .indent_4 },
+    };
+
+    try stringify.beginObject();
+    for (tensor_metadata) |metadata| {
+        try stringify.objectField(metadata.name);
+
+        const item: RawMetaData = .{
+            .dtype = metadata.dtype,
+            .shape = metadata.shape,
+            .data_offsets = .{ metadata.relative_start, metadata.relative_end },
+        };
+
+        try stringify.write(item);
+    }
+    try stringify.endObject();
+}
+
+pub fn writeHeader(allocator: mem.Allocator, tensor_metadata: []const TensorMetaData, writer: *Io.Writer) !void {
+    var allocating: Io.Writer.Allocating = .init(allocator);
+    defer allocating.deinit();
+
+    try stringifyHeader(tensor_metadata, &allocating.writer);
+    const json_bytes = allocating.writer.buffered();
+    const padding = (8 - (json_bytes.len % 8)) % 8; // this ensures that the json is ends on an aligned boundary for the binary data to start
+    // std.debug.print("padding {}\n", .{padding});
+    try writer.writeInt(u64, @intCast(json_bytes.len + padding), .little);
+    try writer.writeAll(json_bytes);
+    try writer.splatByteAll(' ', padding);
+}
+
 pub const DType = enum {
     BOOL,
     U8,
