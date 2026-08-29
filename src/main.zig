@@ -9,6 +9,7 @@ const process = std.process;
 const log = std.log;
 const Cli = @import("Cli.zig");
 const safetensors = @import("safetensors.zig");
+const Weights = @import("Weights.zig");
 
 pub fn main(init: process.Init.Minimal) !void {
     const allocator = heap.smp_allocator;
@@ -21,6 +22,7 @@ pub fn main(init: process.Init.Minimal) !void {
         return;
     };
     defer it.deinit();
+    _ = it.skip();
 
     var cli: Cli = Cli.parse(&it) catch |err| {
         log.err("{}\n", .{err});
@@ -41,4 +43,18 @@ pub fn main(init: process.Init.Minimal) !void {
         return;
     };
     defer parsed_safetensor.deinit();
+    parsed_safetensor.sortByRelativeStart();
+
+    var weigths: Weights = .init();
+    defer weigths.deinit(allocator);
+
+    weigths.buildTensorMap(allocator, &parsed_safetensor.values) catch |err| {
+        log.err("{}\n", .{err});
+        return;
+    };
+
+    weigths.buildNvfp4WeightsIndex(allocator, parsed_safetensor.values.slice().items(.name)) catch |err| {
+        log.err("{}\n", .{err});
+        return;
+    };
 }

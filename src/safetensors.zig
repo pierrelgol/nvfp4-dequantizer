@@ -36,6 +36,11 @@ pub fn parseSafetensorsStreaming(allocator: mem.Allocator, reader: *Io.Reader) !
         return error.InvalidFileFormat;
     }
 
+    const parse_options: json.ParseOptions = .{
+        .max_value_len = @intCast(header_size),
+        .allocate = .alloc_always,
+    };
+
     var sequence: usize = 0;
     while (true) : (sequence += 1) {
         const object = try json_reader.nextAlloc(arena, .alloc_always);
@@ -48,15 +53,16 @@ pub fn parseSafetensorsStreaming(allocator: mem.Allocator, reader: *Io.Reader) !
 
         if (mem.eql(u8, "__metadata__", name)) {
             try json_reader.skipValue();
+            continue;
         }
 
-        const parsed = try json.innerParse(safetensors.Raw, arena, &json_reader, .{});
+        const parsed = try json.innerParse(safetensors.Raw, arena, &json_reader, parse_options);
 
         if (parsed.data_offsets[0] > parsed.data_offsets[1]) {
             return error.InvalidFileFormat;
         }
 
-        try result.values.append(allocator, .{
+        try result.values.append(arena, .{
             .sequence = sequence,
             .name = try arena.dupe(u8, name),
             .dtype = parsed.dtype,
@@ -84,10 +90,23 @@ pub const Result = struct {
     values: std.MultiArrayList(safetensors.MetaData),
     tensors_start_seek_position: usize = 0,
 
+    var locked: bool = false;
+
+    /// those are to ensure poionter stability for the
+    /// next step of the pipeline since MAL doesn't have
+    /// lockPointers
+    pub fn lock(_: *const Result) void {
+        std.debug.assert(locked == false);
+    }
+
+    pub fn unlock(_: *const Result) void {
+        std.debug.assert(locked);
+    }
+
     const SortCtx = struct {
         relative_starts: []const u64,
 
-        fn lessThan(ctx: @This(), lhs_index: usize, rhs_index: usize) bool {
+        pub fn lessThan(ctx: @This(), lhs_index: usize, rhs_index: usize) bool {
             return ctx.relative_starts[lhs_index] < ctx.relative_starts[rhs_index];
         }
     };
@@ -102,7 +121,7 @@ pub const Result = struct {
 
     pub fn sortByRelativeStart(self: *Result) void {
         const values = self.values.slice();
-        self.values.sort(.{
+        self.values.sort(SortCtx{
             .relative_starts = values.items(.relative_start),
         });
     }
