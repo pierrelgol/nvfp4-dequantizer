@@ -25,12 +25,8 @@ pub const Error = error{
     UnknownArgument,
 } || mem.Allocator.Error;
 
-pub fn parse(init: process.Init.Minimal, allocator: mem.Allocator) Error!Cli {
+pub fn parse(it: *process.Args.Iterator) Error!Cli {
     var self: Cli = .empty;
-
-    var it = try init.args.iterateAllocator(allocator);
-    defer it.deinit();
-    _ = it.skip();
 
     while (it.next()) |argument| {
         const trimmed = mem.trim(u8, argument, &ascii.whitespace);

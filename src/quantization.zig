@@ -24,3 +24,25 @@ pub const Format = enum {
         }
     }
 };
+
+pub const DType = enum {
+    BOOL,
+    U8,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+    U64,
+    I64,
+    F4,
+    F6_E2M3,
+    F6_E3M2,
+    F8_E4M3,
+    F8_E5M2,
+    F8_E8M0,
+    F16,
+    BF16,
+    F32,
+    F64,
+};
