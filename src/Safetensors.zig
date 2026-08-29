@@ -14,6 +14,16 @@ pub const Error = error{
     SomeTingWong, // TODO replace placeholder
 };
 
+// TODO now that I think about it there could be one approach which consist of simply scanning to find
+// weights boundarie during safetensors header parse
+// because my planned pipeline currently is like
+//
+// [1T parse] -> [1T merge into units of concurrency] -> [NT consume and dequantize]
+//
+// but potentially if this is feasible we could have somnething like this
+//
+// [1T find_boundaries] -> [NT merges boundaries in units of concurrency] -> [NT consume and dequantize]
+//
 pub fn parseSafetensorHeader(allocator: mem.Allocator, reader: *Io.Reader) ![]TensorMetaData {
     const header_size = try decodeJsonHeaderSize(reader);
     var list: std.ArrayListUnmanaged(TensorMetaData) = .empty;
