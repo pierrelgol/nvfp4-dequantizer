@@ -48,10 +48,11 @@ pub fn run(self: *TensorBuilder, io: std.Io) !void {
             // 3 times. bc that's O(N * M * 3) maybe a prefix map ?
             try self.output.putOne(io, .{
                 .id = i,
+                .name = w.name,
                 .weights = w,
                 .scale = findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".weight_scale"),
                 .global_scale = findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".weight_global_scale"),
-                .global_input_scale = findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".weight_global_scale"),
+                .global_input_scale = findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".input_global_scale"),
             });
         }
     }
@@ -98,7 +99,7 @@ pub const QuantizedWeight = struct {
     global_scale: ?Safetensors.TensorMetaData = null,
     global_input_scale: ?Safetensors.TensorMetaData = null,
 
-    pub fn isComplete(self: *const QuantizedWeight) void {
+    pub fn isComplete(self: *const QuantizedWeight) bool {
         return if (self.name != null and self.weights != null and self.scale != null and self.global_scale != null and self.global_input_scale != null) true else false;
     }
 };

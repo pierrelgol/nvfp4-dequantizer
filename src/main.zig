@@ -42,7 +42,8 @@ pub fn main(init: std.process.Init) !void {
     const stdout: *Io.Writer = &stdout_writer.interface;
 
     const arena = init.arena.allocator();
-    const tensor_metadata = try Safetensors.parseSafetensorHeader(arena, reader);
+    const parsedTensorMetadata = try Safetensors.parseSafetensorHeader(arena, reader);
+    const tensor_metadata = parsedTensorMetadata.tensors;
 
     var tensor_builder_output_queue_buffer: [32]TensorBuilder.QuantizedWeight = undefined;
     var tensor_builder_output_queue: Io.Queue(TensorBuilder.QuantizedWeight) = .init(&tensor_builder_output_queue_buffer);

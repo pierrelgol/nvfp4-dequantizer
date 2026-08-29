@@ -8,6 +8,7 @@ const ascii = std.ascii;
 const Io = std.Io;
 const process = std.process;
 const json = std.json;
+pub const Safetensors = @This();
 
 pub const Error = error{
     HeaderTooLarge,
@@ -24,9 +25,22 @@ pub const Error = error{
 //
 // [1T find_boundaries] -> [NT merges boundaries in units of concurrency] -> [NT consume and dequantize]
 //
-pub fn parseSafetensorHeader(allocator: mem.Allocator, reader: *Io.Reader) ![]TensorMetaData {
+
+pub const ParsedTensorMetadata = struct {
+    tensors: TensorMetaData,
+    positionnal_binary_data_start: usize,
+};
+
+pub fn parseSafetensorHeader(allocator: mem.Allocator, reader: *Io.Reader) !ParsedTensorMetadata {
+    var result: ParsedTensorMetadata = undefined;
+
     const header_size = try decodeJsonHeaderSize(reader);
     var list: std.ArrayListUnmanaged(TensorMetaData) = .empty;
+
+    // this is where the relative index will really start
+    // because in the format of safetensors the first bytes looks like this
+    // [header_size: [0..8]][json_header: [0..100 * 1024 * 1024]]
+    result.positionnal_binary_data_start = @sizeOf(u64) + header_size;
 
     var limited_buffer: [std.heap.pageSize()]u8 = undefined;
     var limited = reader.limited(.limited(@intCast(header_size)), &limited_buffer);
@@ -82,6 +96,7 @@ pub fn parseSafetensorHeader(allocator: mem.Allocator, reader: *Io.Reader) ![]Te
 fn decodeJsonHeaderSize(reader: *Io.Reader) !u64 {
     const header_size = try reader.takeInt(JsonHeader, std.lang.Endian.little); // TODO look on google wether safetensor is always little endian
 
+    //TODO verify it's inclusive
     if (header_size > (100 * 1024 * 1024)) { // 100MB according to https://www.datacamp.com/blog/safetensors-format
         return error.HeaderTooLarge;
     }
