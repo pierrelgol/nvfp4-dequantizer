@@ -29,7 +29,13 @@ pub fn init(
     };
 }
 
+pub fn deinit(self: *TensorBuilder) void {
+    defer self.* = undefined;
+}
+
 pub fn run(self: *TensorBuilder, io: std.Io) !void {
+    defer self.output.close(io);
+
     for (self.tensor_metadata, 0..) |w, i| {
         const weight_boundary_start = ".weight_packed";
         const basename_of_current_weight = weightName(w.name, '.') orelse continue;
@@ -43,20 +49,33 @@ pub fn run(self: *TensorBuilder, io: std.Io) !void {
             try self.output.putOne(io, .{
                 .id = i,
                 .weights = w,
-                .weigt_scale = findWholeQuantizedWeights(self.allocator, self.tensor_metadata, basename_of_current_weight, ".weight_scale"),
-                .scale = findWholeQuantizedWeights(self.allocator, self.tensor_metadata, basename_of_current_weight, ".weight_global_scale"),
-                .global_input_scale = findWholeQuantizedWeights(self.allocator, self.tensor_metadata, basename_of_current_weight, ".weight_global_scale"),
+                .scale = findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".weight_scale"),
+                .global_scale = findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".weight_global_scale"),
+                .global_input_scale = findWholeQuantizedWeights(self.tensor_metadata, basename_of_current_weight, ".weight_global_scale"),
             });
         }
     }
 }
 
-fn findWholeQuantizedWeights(allocator: mem.Allocator, tensor_metadata: []Safetensors.TensorMetaData, base: []const u8, suffix: []const u8) ?Safetensors.TensorMetaData {
+fn findWholeQuantizedWeights(tensor_metadata: []Safetensors.TensorMetaData, base: []const u8, suffix: []const u8) ?Safetensors.TensorMetaData {
     // TODO look if all the tensor metadata are always in order in the json or not, since we could have a more efficient for loop if we could just pass
     // tensor_metadata[last_iteration_index..] instead of the whole slice.
-    for (tensor_metadata) |candidate| {
-        _ = candidate;
-    }
+    const total_len_of_base_plus_suffix = base.len + suffix.len;
+    return for (tensor_metadata) |maybe_result| {
+        if (maybe_result.name.len != total_len_of_base_plus_suffix) {
+            continue;
+        }
+
+        if (!std.mem.startsWith(u8, maybe_result.name, base)) {
+            continue;
+        }
+
+        if (!std.mem.endsWith(u8, maybe_result.name, suffix)) {
+            continue;
+        }
+
+        break maybe_result;
+    } else null;
 }
 
 // fn weightBasename(slice: []const u8, sep: u8) ?[]const u8 {
@@ -72,6 +91,7 @@ fn weightName(slice: []const u8, sep: u8) ?[]const u8 {
 /// this is the combination of multiple entries in the json combined into one
 /// dequantizable unit of concurrency
 pub const QuantizedWeight = struct {
+    id: usize,
     name: ?[]const u8 = null,
     weights: ?Safetensors.TensorMetaData = null,
     scale: ?Safetensors.TensorMetaData = null,

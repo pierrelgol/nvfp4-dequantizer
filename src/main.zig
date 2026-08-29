@@ -9,6 +9,7 @@ const Io = std.Io;
 const process = std.process;
 const Args = @import("Args.zig");
 const Safetensors = @import("Safetensors.zig");
+const TensorBuilder = @import("TensorBuilder.zig");
 const builtin = @import("builtin");
 
 pub fn main(init: std.process.Init) !void {
@@ -42,7 +43,28 @@ pub fn main(init: std.process.Init) !void {
 
     const arena = init.arena.allocator();
     const tensor_metadata = try Safetensors.parseSafetensorHeader(arena, reader);
-    _ = tensor_metadata;
+
+    var tensor_builder_output_queue_buffer: [32]TensorBuilder.QuantizedWeight = undefined;
+    var tensor_builder_output_queue: Io.Queue(TensorBuilder.QuantizedWeight) = .init(&tensor_builder_output_queue_buffer);
+
+    var tensor_builder: TensorBuilder = .init(allocator, tensor_metadata, &tensor_builder_output_queue);
+    defer tensor_builder.deinit();
+
+    var tensor_builder_future = try io.concurrent(TensorBuilder.run, .{ &tensor_builder, io });
+    defer tensor_builder_future.cancel(io) catch {};
+
+    while (true) {
+        const item = tensor_builder_output_queue.getOne(io) catch |err| {
+            switch (err) {
+                error.Closed => {
+                    log.info("done", .{});
+                    return;
+                },
+                else => return err,
+            }
+        };
+        _ = item;
+    }
 
     try stdout.flush();
 }
