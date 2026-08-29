@@ -99,3 +99,31 @@ pub const QuantizedWeight = struct {
     global_scale: Safetensors.TensorMetaData,
     global_input_scale: Safetensors.TensorMetaData,
 };
+
+fn testMetadata(name: []const u8, start: u64, end: u64) Safetensors.TensorMetaData {
+    return .{
+        .name = name,
+        .dtype = .F32,
+        .shape = &.{1},
+        .relative_start = start,
+        .relative_end = end,
+    };
+}
+
+test "handle out of order" {
+    const metadata = [_]Safetensors.TensorMetaData{
+        testMetadata("layer.weight_scale", 8, 10),
+        testMetadata("unrelated.weight", 26, 30),
+        testMetadata("layer.weight_packed", 10, 26),
+        testMetadata("layer.input_global_scale", 0, 4),
+        testMetadata("layer.weight_global_scale", 4, 8),
+    };
+
+    const scale = try findWholeQuantizedWeights(&metadata, "layer", ".weight_scale");
+    const global_scale = try findWholeQuantizedWeights(&metadata, "layer", ".weight_global_scale");
+    const input_scale = try findWholeQuantizedWeights(&metadata, "layer", ".input_global_scale");
+
+    try std.testing.expectEqualStrings("layer.weight_scale", scale.name);
+    try std.testing.expectEqualStrings("layer.weight_global_scale", global_scale.name);
+    try std.testing.expectEqualStrings("layer.input_global_scale", input_scale.name);
+}

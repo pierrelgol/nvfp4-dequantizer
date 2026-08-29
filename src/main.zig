@@ -12,6 +12,7 @@ const Safetensors = @import("Safetensors.zig");
 const TensorBuilder = @import("TensorBuilder.zig");
 const Dequantizer = @import("Dequantizer.zig");
 const Nvfp4 = @import("Nvfp4.zig");
+const utils = @import("utils.zig");
 const builtin = @import("builtin");
 
 pub fn main(init: std.process.Init) !void {
@@ -35,9 +36,17 @@ pub fn main(init: std.process.Init) !void {
     };
     defer file.close(io);
 
+    const stats = try file.stat(io);
+
+    var b = utils.Benchmark.start(io);
+
     var file_reader_buffer: [std.heap.pageSize()]u8 = undefined;
     var file_reader: Io.File.Reader = .init(file, io, &file_reader_buffer);
     const reader: *Io.Reader = &file_reader.interface;
+
+    var stdout_reader_buffer: [std.heap.pageSize()]u8 = undefined;
+    var stdout_reader: Io.File.Writer = .init(.stdout(), io, &stdout_reader_buffer);
+    const stdout: *Io.Writer = &stdout_reader.interface;
 
     const arena = init.arena.allocator();
     const parsedTensorMetadata = try Safetensors.parseSafetensorHeader(arena, reader);
@@ -104,6 +113,9 @@ pub fn main(init: std.process.Init) !void {
 
     try dequantizer_future.await(io);
     try tensor_builder_future.await(io);
+    b.stop(io, stats.size);
+    try stdout.print("{f}\n", .{b});
+    try stdout.flush();
     try output.flush();
 }
 

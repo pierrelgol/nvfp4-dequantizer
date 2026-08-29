@@ -1,2 +1,2 @@
 # nvfp4-dequantizer
-Implementation of a streamin NVFP4 dequantizer
+Implementation of a streaming NVFP4 dequantizer

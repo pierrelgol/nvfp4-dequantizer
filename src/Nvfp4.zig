@@ -19,6 +19,7 @@ pub fn decodePackedWeights(packed_weights: PackedWeights, scale: u8, weight_glob
     return result;
 }
 
+/// used this as inspiration: https://github.com/ggml-org/ggml/blob/master/src/ggml-quants.c#L589
 fn decodeE2M1(w: u4) f32 {
     const magnitude = [_]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
     const value = magnitude[w & 0x7];
@@ -35,4 +36,28 @@ fn decodeE4M3(s: u8) f32 {
     }
     const fraction = 1.0 + @as(f32, @floatFromInt(mantissa)) / 8.0;
     return sign * std.math.scalbn(fraction, @as(i32, exponent) - 7);
+}
+
+test "all values for the e2m1" {
+    const test_case: PackedWeights = .{
+        0x10, 0x32, 0x54, 0x76,
+        0x98, 0xBA, 0xDC, 0xFE,
+    };
+    const expected: DecodedWeights = .{
+        0.0,  0.5,  1.0,  1.5,
+        2.0,  3.0,  4.0,  6.0,
+        -0.0, -0.5, -1.0, -1.5,
+        -2.0, -3.0, -4.0, -6.0,
+    };
+
+    const actual = decodePackedWeights(test_case, 0x38, 1.0);
+    try std.testing.expectEqualSlices(f32, &expected, &actual);
+}
+
+test "global and local scale" {
+    const packed_weights: PackedWeights = @splat(0x22);
+    const expected: DecodedWeights = @splat(0.5);
+
+    const actual = decodePackedWeights(packed_weights, 0x40, 4.0);
+    try std.testing.expectEqualSlices(f32, &expected, &actual);
 }
