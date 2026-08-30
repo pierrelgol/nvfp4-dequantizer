@@ -112,11 +112,11 @@ const RuntimeWeight = struct {
 };
 
 const WeightChunk = struct {
-    const weights_capacity: usize = 16 * 1024;
-    const scale_capacity: usize = weights_capacity / 8;
-    const output_capacity: usize = weights_capacity * 8;
+    pub const weights_capacity: usize = 16 * 1024;
+    pub const scale_capacity: usize = weights_capacity / 8;
+    pub const output_capacity: usize = weights_capacity * 8;
 
-    buffer: [math.floorPowerOfTwo(usize, weights_capacity + scale_capacity + output_capacity)]u8 = undefined,
+    buffer: [weights_capacity + scale_capacity + output_capacity]u8 = undefined,
     sequence: usize,
     input_byte_count: usize,
     output_byte_count: usize,
@@ -385,17 +385,10 @@ pub fn dequantNvfp4(
     const starts = tensors.items(.relative_start);
     const ends = tensors.items(.relative_end);
     var input_offset: u64 = 0;
+    var seq: usize = 0;
 
-    for (
-        weights.steps,
-        starts,
-        ends,
-    ) |step, tensor_start, tensor_end| {
-        try discardExactTensor(
-            reader,
-            &input_offset,
-            tensor_start,
-        );
+    for (weights.steps, starts, ends) |step, tensor_start, tensor_end| {
+        try discardExactTensor(reader, &input_offset, tensor_start);
 
         std.debug.assert(tensor_end >= tensor_start);
         const tensor_size = tensor_end - tensor_start;
@@ -405,11 +398,23 @@ pub fn dequantNvfp4(
 
         switch (step) {
             .copy => {
-                try streamExactTensor(
-                    reader,
-                    writer,
-                    tensor_size,
-                );
+                var remaining_bytes = tensor_size;
+
+                while (remaining_bytes > 0) {
+                    const output_byte_count_u64 = @min(
+                        remaining_bytes,
+                        @as(u64, WeightChunk.output_capacity),
+                    );
+                    const output_byte_count: usize = @intCast(output_byte_count_u64);
+                    const chunk = try chunk_pool.available_queue.getOne(io);
+                    chunk.prepareChunkForCopy(seq, output_byte_count, 0);
+
+                    try reader.readSliceAll(chunk.outputBytes());
+                    try chunk_pool.processed_queue.putOne(io, chunk);
+
+                    seq += 1;
+                    remaining_bytes -= output_byte_count_u64;
+                }
             },
             .cache_local_scale => |weight_index| {
                 std.debug.assert(weight_index < runtime_weights.len);
@@ -442,15 +447,32 @@ pub fn dequantNvfp4(
                 const local_scales = runtime_weight.local_scales.?;
                 const global_scale = runtime_weight.global_scale.?;
 
-                try dequantizeNvpf4Tensor(
-                    io,
-                    reader,
-                    writer,
-                    tensor_size,
-                    local_scales,
-                    global_scale,
-                );
+                var remaining = tensor_size;
+                var scale_offset: usize = 0;
 
+                while (remaining > 0) {
+                    const byte_count_u64 = @min(remaining, WeightChunk.weights_capacity);
+                    const byte_count: usize = @intCast(byte_count_u64);
+
+                    std.debug.assert(byte_count % @sizeOf(Nvfp4.PackedWeights) == 0);
+                    const scale_count = byte_count / @sizeOf(Nvfp4.PackedWeights);
+                    const chunk = try chunk_pool.available_queue.getOne(io);
+
+                    chunk.prepareChunkForDequant(seq, byte_count, global_scale);
+
+                    try reader.readSliceAll(chunk.weightsBytes());
+                    const source = local_scales[scale_offset..][0..scale_count];
+
+                    @memcpy(chunk.localScaleBytes(), source);
+
+                    try chunk_pool.being_decoded_queue.putOne(io, chunk);
+
+                    seq += 1;
+                    scale_offset += scale_count;
+                    remaining -= byte_count_u64;
+                }
+
+                std.debug.assert(scale_offset == local_scales.len);
                 allocator.free(local_scales);
                 runtime_weight.local_scales = null;
             },
@@ -487,58 +509,6 @@ pub fn readLocalScales(allocator: mem.Allocator, reader: *Io.Reader, byte_len: u
     try reader.readSliceAll(scales);
 
     return scales;
-}
-
-pub fn dequantizeNvpf4Tensor(
-    io: std.Io,
-    reader: *Io.Reader,
-    writer: *Io.Writer,
-    weights_byte_size: u64,
-    local_scales: []const u8,
-    global_scale: f32,
-) !void {
-    _ = io;
-    const weights_blokc_size = @sizeOf(quantization.Nvfp4.PackedWeights);
-
-    std.debug.assert(weights_byte_size % weights_blokc_size == 0);
-
-    const weights_counts = math.cast(
-        usize,
-        weights_byte_size / weights_blokc_size,
-    ) orelse return error.TensorTooLarge;
-
-    std.debug.assert(weights_counts == local_scales.len);
-
-    var packed_weights: quantization.Nvfp4.PackedWeights = undefined;
-    var output_bytes: [@sizeOf(quantization.Nvfp4.DecodedWeights)]u8 = undefined;
-
-    for (local_scales) |local_scale| {
-        try reader.readSliceAll(&packed_weights);
-
-        const decoded = quantization.Nvfp4.decodePackedWeights(
-            packed_weights,
-            local_scale,
-            global_scale,
-        );
-
-        for (decoded, 0..) |value, value_index| {
-            const bits: u32 = @bitCast(value);
-            const byte_index = value_index * @sizeOf(f32);
-
-            mem.writeInt(
-                u32,
-                output_bytes[byte_index..][0..@sizeOf(u32)],
-                bits,
-                .little,
-            );
-        }
-
-        try writer.writeAll(&output_bytes);
-    }
-}
-
-fn streamExactTensor(reader: *Io.Reader, writer: *Io.Writer, tensor_size: u64) !void {
-    try reader.streamExact64(writer, tensor_size);
 }
 
 fn discardExactTensor(reader: *Io.Reader, cursor_position: *u64, tensor_start: u64) !void {
