@@ -486,10 +486,6 @@ pub fn dequantNvfp4(
     var writer_future = try io.concurrent(quantization.orderWriteWorker, .{ io, writer, &chunk_pool });
     var worker_group: Io.Group = .init;
 
-    for (0..4) |_| {
-        try worker_group.concurrent(io, quantization.decodeWeightChunkWorker, .{ io, &chunk_pool });
-    }
-
     defer {
         if (!worker_done or !writer_done) {
             chunk_pool.available_queue.close(io);
@@ -504,6 +500,10 @@ pub fn dequantNvfp4(
                 _ = writer_future.cancel(io) catch {};
             }
         }
+    }
+
+    for (0..4) |_| {
+        try worker_group.concurrent(io, quantization.decodeWeightChunkWorker, .{ io, &chunk_pool });
     }
 
     const runtime_weights = try allocator.alloc(
@@ -620,12 +620,16 @@ pub fn dequantNvfp4(
 
     chunk_pool.being_decoded_queue.close(io);
 
-    try worker_group.await(io);
+    worker_group.await(io) catch |err| {
+        return chunk_pool.getError(io) orelse err;
+    };
     worker_done = true;
 
     chunk_pool.processed_queue.close(io);
 
-    try writer_future.await(io);
+    writer_future.await(io) catch |err| {
+        return chunk_pool.getError(io) orelse err;
+    };
     writer_done = true;
 
     if (chunk_pool.getError(io)) |err| {
