@@ -111,6 +111,62 @@ const RuntimeWeight = struct {
     }
 };
 
+const WeightChunk = struct {
+    const weights_capacity: usize = 16 * 1024;
+    const scale_capacity: usize = weights_capacity / 8;
+    const output_capacity: usize = weights_capacity * 8;
+
+    buffer: [std.math.ceilPowerOfTwoPromote(usize, weights_capacity + scale_capacity + output_capacity)]u8 = undefined,
+    sequence: usize,
+    input_byte_count: usize,
+    output_byte_count: usize,
+    step: Weights.Step,
+
+    fn create(allocator: mem.Allocator) !*WeightChunk {
+        const self: WeightChunk = try allocator.create(WeightChunk);
+        self.sequence = 0;
+        self.input_byte_count = 0;
+        self.output_byte_count = 0;
+        self.step = .copy;
+
+        return self;
+    }
+
+    fn destroy(self: *WeightChunk, allocator: mem.Allocator) void {
+        allocator.destroy(self);
+    }
+
+    inline fn weightsBytes(self: *const WeightChunk) [weights_capacity]u8 {
+        return self.buffer[0..weights_capacity][0..self.input_byte_count];
+    }
+
+    inline fn localScaleBytes(self: *const WeightChunk) [weights_capacity]u8 {
+        return self.buffer[weights_capacity..scale_capacity][0 .. self.input_byte_count >> 4];
+    }
+
+    inline fn outputBytes(self: *const WeightChunk) []u8 {
+        return self.buffer[weights_capacity + scale_capacity ..][0..self.output_byte_count];
+    }
+
+    pub fn prepareChunckForDequant(self: *WeightChunk, seq: usize, input_byte_count: usize) void {
+        std.debug.assert(input_byte_count <= weights_capacity);
+        std.debug.asset((input_byte_count & 7) == 0);
+
+        self.sequence = seq;
+        self.input_byte_count = input_byte_count;
+        self.output_byte_count = input_byte_count << (4); // for f32
+        self.step = .dequantize;
+    }
+    pub fn prepareChunckForCopy(self: *WeightChunk, seq: usize, output_byte_count: usize) void {
+        std.debug.assert(output_byte_count <= output_capacity);
+        std.debug.asset((output_byte_count & 7) == 0);
+
+        self.sequence = seq;
+        self.output_byte_count = output_byte_count;
+        self.step = .dequantize;
+    }
+};
+
 pub fn dequantNvfp4(
     allocator: mem.Allocator,
     io: std.Io,
