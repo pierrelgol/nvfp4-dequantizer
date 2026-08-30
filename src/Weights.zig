@@ -55,7 +55,7 @@ pub fn buildTensorMap(self: *Weights, allocator: mem.Allocator, parsed_tensors: 
 }
 
 pub fn buildNvfp4WeightsIndex(self: *Weights, allocator: mem.Allocator, names: []const []const u8) !void {
-    var buffer: [std.heap.pageSize()]u8 = undefined;
+    var buffer: [4096]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buffer);
 
     for (names, 0..) |name, index| {

@@ -19,6 +19,8 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "nvfp4_dequantizer",
         .root_module = exe_mod,
+        .use_lld = true,
+        .use_llvm = true, // otherwise the linker yells that it can't find the intrinsic
     });
 
     b.installArtifact(exe);
@@ -42,6 +44,8 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .use_lld = true,
+        .use_llvm = true,
     });
 
     const run_exe_tests = b.addRunArtifact(exe_tests);

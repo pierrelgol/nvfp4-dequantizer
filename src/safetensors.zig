@@ -23,7 +23,7 @@ pub fn parseSafetensorsStreaming(allocator: mem.Allocator, reader: *Io.Reader) !
     const header_size = try getHeaderSize(reader);
     result.tensors_start_seek_position = @sizeOf(u64) + header_size;
 
-    var limited_json_buffer: [std.heap.pageSize()]u8 = undefined;
+    var limited_json_buffer: [4096]u8 = undefined;
     var limited_reader: Io.Reader.Limited = .init(
         reader,
         .limited(@intCast(header_size)),

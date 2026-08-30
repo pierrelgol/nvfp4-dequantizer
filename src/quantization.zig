@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const heap = std.heap;
 const Io = std.Io;
@@ -45,6 +46,14 @@ pub const Nvfp4 = struct {
     pub const PackedWeights = [total_packed_weights >> 1]u8; // 8 * u4 = 16 u4 in E2m1
     pub const DecodedWeights = [total_packed_weights]f32;
 
+    const ByteVector = @Vector(total_packed_weights, i8);
+    const FloatBitsVector = @Vector(total_packed_weights, u32);
+
+    // this is needed to match the GGML implementation because Zig doesn't have a
+    // pshuf table look up builtin
+    extern fn @"llvm.x86.ssse3.pshuf.b.128"(table: ByteVector, indices: ByteVector) ByteVector;
+    extern fn @"llvm.aarch64.neon.tbl1.v16i8"(table: ByteVector, indices: ByteVector) ByteVector;
+
     // E2M1 and UE4M3 lookup tables derived from llama.cpp/ggml:
     // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-common.h#L1123-L1129
     // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-impl.h#L500-L515
@@ -53,6 +62,7 @@ pub const Nvfp4 = struct {
     pub const e4m3_lut: [256]f32 = generateE4M3Lut();
 
     fn generateE2M1Lut() [16]i8 {
+        @setEvalBranchQuota(10000);
         var lut: [16]i8 = undefined;
 
         for (0..lut.len) |index| {
@@ -91,6 +101,7 @@ pub const Nvfp4 = struct {
     ///    return raw * 0.5f;
     ///}
     fn generateE4M3Lut() [256]f32 {
+        @setEvalBranchQuota(100000);
         var lut: [256]f32 = undefined;
 
         for (0..lut.len) |index| {
@@ -124,41 +135,82 @@ pub const Nvfp4 = struct {
         return lut;
     }
 
-    // TODO SIMD version
-    pub fn decodePackedWeights(packed_weights: PackedWeights, scale: u8, weight_global_scale: f32) DecodedWeights {
-        var result: DecodedWeights = undefined;
-        const scaling_factor: f32 = decodeE4M3(scale) / weight_global_scale;
+    pub fn decodePackedWeights(packed_weights: PackedWeights, scale: u8, inverse_global_scale: f32) DecodedWeights {
+        const PackedVector = @Vector(8, u8);
+        const CodeVector = @Vector(16, u8);
+        const SignedVector = @Vector(16, i8);
+        const FloatVector = @Vector(16, f32);
+        const ShuffleMask = @Vector(16, i32);
+        const nibble_mask: PackedVector = @splat(0x0f);
+        const nibble_shift: PackedVector = @splat(4);
 
-        for (packed_weights, 0..) |w, i| {
-            // assumes interleaved
-            result[i * 2] = decodeE2M1(@as(u4, @truncate(w))) * scaling_factor; // first 4 bits
-            result[i * 2 + 1] = decodeE2M1(@as(u4, @truncate(w >> 4))) * scaling_factor; // and the second ones;
-        }
+        const interleave_mask: ShuffleMask = .{
+            0, -1, 1, -2, 2, -3, 3, -4,
+            4, -5, 5, -6, 6, -7, 7, -8,
+        };
 
-        return result;
-    }
+        const quantized_weights: PackedVector = @bitCast(packed_weights);
+        const low = quantized_weights & nibble_mask;
+        const high = quantized_weights >> nibble_shift;
+        const code: CodeVector = @shuffle(u8, low, high, interleave_mask);
+        const code_values: [total_packed_weights]u8 = @bitCast(code);
+        const table: ByteVector = @bitCast(e2m1_lut);
+        const indices: ByteVector = @bitCast(code);
 
-    /// used this as inspiration: https://github.com/ggml-org/ggml/blob/master/src/ggml-quants.c#L589
-    // TODO SIMD version
-    fn decodeE2M1(w: u4) f32 {
-        const magnitude = [_]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
-        const value = magnitude[w & 0x7];
-        return if (w & 0x8 == 0) value else -value;
-    }
+        const e2m1: SignedVector = switch (builtin.cpu.arch) {
+            .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3))
+                @"llvm.x86.ssse3.pshuf.b.128"(table, indices)
+            else blk: {
+                var values: [total_packed_weights]i8 = undefined;
+                for (code_values, 0..) |value, index| {
+                    values[index] = e2m1_lut[value];
+                }
+                break :blk @bitCast(values);
+            },
+            .aarch64 => @"llvm.aarch64.neon.tbl1.v16i8"(table, indices),
+            else => blk: {
+                var values: [total_packed_weights]i8 = undefined;
+                for (code_values, 0..) |value, index| {
+                    values[index] = e2m1_lut[value];
+                }
+                break :blk @bitCast(values);
+            },
+        };
 
-    // TODO SIMD version
-    fn decodeE4M3(s: u8) f32 {
-        const sign: f32 = if (s & 0x80 == 0) 1 else -1;
-        const exponent = (s >> 3) & 0x0f;
-        const mantissa = s & 0x07;
+        const converted_values: FloatVector = @floatFromInt(e2m1);
+        const unsigned_values: FloatBitsVector = @bitCast(converted_values);
+        const negative_zero_code: CodeVector = @splat(0b1000);
+        const negative_zero_bits: FloatBitsVector = @splat(0x8000_0000);
+        const values: FloatVector = @bitCast(@select(
+            u32,
+            code == negative_zero_code,
+            negative_zero_bits,
+            unsigned_values,
+        ));
+        const scaling_factor = e4m3_lut[scale] * inverse_global_scale;
+        const scaling_vector: FloatVector = @splat(scaling_factor);
+        const decoded = values * scaling_vector;
 
-        if (exponent == 0) {
-            return sign * @as(f32, @floatFromInt(mantissa)) / 512.0;
-        }
-        const fraction = 1.0 + @as(f32, @floatFromInt(mantissa)) / 8.0;
-        return sign * std.math.scalbn(fraction, @as(i32, exponent) - 7);
+        return @bitCast(decoded);
     }
 };
+
+test "NVFP4 SIMD decode matches every E2M1 code" {
+    const packed_weights: Nvfp4.PackedWeights = .{
+        0x10, 0x32, 0x54, 0x76,
+        0x98, 0xba, 0xdc, 0xfe,
+    };
+
+    const decoded = Nvfp4.decodePackedWeights(packed_weights, 0x40, 1.0);
+
+    for (decoded, Nvfp4.e2m1_lut) |actual, expected_integer| {
+        const expected: f32 = @floatFromInt(expected_integer);
+        try std.testing.expectEqual(expected, actual);
+    }
+
+    const negative_zero_bits: u32 = @bitCast(decoded[8]);
+    try std.testing.expectEqual(0x8000_0000, negative_zero_bits);
+}
 
 pub const DType = enum {
     BOOL,
@@ -330,12 +382,13 @@ fn decodeWeightChunk(chunk: *WeightChunk) void {
     std.debug.assert(local_scales.len == weights_bvte.len / weights_chunk_size);
     std.debug.assert(output_bytes.len == local_scales.len * decoded_chunk_size);
 
+    const inverse_global_scale = 1.0 / chunk.global_scale;
     for (local_scales, 0..) |local_scale, weight_index| {
         const weight_start = weight_index * weights_chunk_size;
         const decoded_start = weight_index * decoded_chunk_size;
 
         const weights: Nvfp4.PackedWeights = weights_bvte[weight_start..][0..weights_chunk_size].*;
-        const decoded = Nvfp4.decodePackedWeights(weights, local_scale, chunk.global_scale);
+        const decoded = Nvfp4.decodePackedWeights(weights, local_scale, inverse_global_scale);
         const output_block = output_bytes[decoded_start..][0..decoded_chunk_size];
 
         for (decoded, 0..) |value, index| {
