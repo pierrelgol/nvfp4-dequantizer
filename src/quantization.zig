@@ -120,7 +120,8 @@ const WeightChunk = struct {
     sequence: usize,
     input_byte_count: usize,
     output_byte_count: usize,
-    step: Weights.Step,
+    global_scale: usize,
+    step: enum { copy, decode },
 
     fn create(allocator: mem.Allocator) !*WeightChunk {
         const self: WeightChunk = try allocator.create(WeightChunk);
@@ -148,23 +149,62 @@ const WeightChunk = struct {
         return self.buffer[weights_capacity + scale_capacity ..][0..self.output_byte_count];
     }
 
-    pub fn prepareChunckForDequant(self: *WeightChunk, seq: usize, input_byte_count: usize) void {
+    pub fn prepareChunckForDequant(self: *WeightChunk, seq: usize, input_byte_count: usize, global_scale: f32) void {
         std.debug.assert(input_byte_count <= weights_capacity);
         std.debug.asset((input_byte_count & 7) == 0);
 
         self.sequence = seq;
         self.input_byte_count = input_byte_count;
         self.output_byte_count = input_byte_count << (4); // for f32
-        self.step = .dequantize;
+        self.step = .decode;
+        self.global_scale = global_scale;
     }
-    pub fn prepareChunckForCopy(self: *WeightChunk, seq: usize, output_byte_count: usize) void {
+    pub fn prepareChunckForCopy(self: *WeightChunk, seq: usize, output_byte_count: usize, global_scale: f32) void {
         std.debug.assert(output_byte_count <= output_capacity);
         std.debug.asset((output_byte_count & 7) == 0);
 
         self.sequence = seq;
         self.output_byte_count = output_byte_count;
-        self.step = .dequantize;
+        self.step = .copy;
+        self.global_scale = global_scale;
     }
+
+    pub const Pool = struct {
+        const number_of_chunks = 16;
+
+        used_count: usize,
+        used_chunks: [number_of_chunks]*WeightChunk,
+        free_chunks: [number_of_chunks]*WeightChunk,
+        queue: Io.Queue(*WeightChunk),
+
+        pub fn init(pool: *WeightChunk.Pool, allocator: mem.Allocator, io: std.Io) !void {
+            pool.queue = .init(&pool.free_chunks);
+            pool.used_chunks = 0;
+
+            errdefer {
+                pool.queue.close(io);
+
+                for (pool.used_chunks[0..pool.used_count]) |chunk| {
+                    chunk.destroy(allocator);
+                }
+            }
+
+            for (0..number_of_chunks) |i| {
+                pool.used_chunks[i] = try WeightChunk.create(allocator);
+                pool.used_chunks += 1;
+                try pool.queue.putOne(io, pool.used_chunks[i]);
+            }
+        }
+
+        pub fn deinit(pool: *WeightChunk.Pool, allocator: mem.Allocator, io: std.Io) void {
+            defer pool.* = undefined;
+            pool.queue.close(io);
+
+            for (pool.used_chunks[0..pool.used_count]) |chunk| {
+                chunk.destroy(allocator);
+            }
+        }
+    };
 };
 
 pub fn dequantNvfp4(
@@ -177,11 +217,15 @@ pub fn dequantNvfp4(
 ) !void {
     @branchHint(.likely);
     std.debug.assert(weights.steps.len == tensors.len);
+    var chunk_pool: WeightChunk.Pool = undefined;
+    try chunk_pool.init(allocator, io);
+    defer chunk_pool.deinit(allocator, io);
 
     const runtime_weights = try allocator.alloc(
         RuntimeWeight,
         weights.weigths.len,
     );
+
     defer {
         for (runtime_weights) |*runtime_weight| {
             runtime_weight.deinit(allocator);
