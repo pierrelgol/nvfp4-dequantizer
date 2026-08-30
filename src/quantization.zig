@@ -253,6 +253,42 @@ fn decodeWeightChunkWorker(io: std.Io, pool: *WeightChunk.Pool) Io.Cancelable!vo
     }
 }
 
+fn orderWriteWorker(io: std.Io, writer: *Io.Writer, pool: *WeightChunk.Pool) !void {
+    var expected_sequence: usize = 0;
+    var pending_chunks_ring_buffer: [WeightChunk.Pool.number_of_chunks]?*WeightChunk = @splat(null);
+
+    while (true) {
+        const chunk = pool.processed_queue.getOne(io) catch |err| {
+            switch (err) {
+                error.Closed => break,
+                error.Canceled => return Io.recancel(io),
+            }
+        };
+
+        const index = chunk.sequence % WeightChunk.Pool.number_of_chunks;
+        std.debug.assert(pending_chunks_ring_buffer[index] == null);
+        pending_chunks_ring_buffer[index] = chunk;
+
+        while (true) {
+            const expected_index = expected_sequence % WeightChunk.Pool.number_of_chunks;
+            const next_chunk = pending_chunks_ring_buffer[expected_index] orelse break;
+            std.debug.assert(next_chunk.sequence == expected_sequence);
+
+            try writer.writeAll(next_chunk.outputBytes());
+            pending_chunks_ring_buffer[expected_index] = null;
+            expected_sequence += 1;
+
+            try pool.available_queue.putOne(io, next_chunk);
+        }
+
+        // for (pending_chunks_ring_buffer) |c| {
+        //     std.debug.assert(c == null);
+        // }
+    }
+
+    try writer.flush();
+}
+
 pub fn dequantNvfp4(
     allocator: mem.Allocator,
     io: std.Io,
