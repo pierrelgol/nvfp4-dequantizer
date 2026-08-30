@@ -116,54 +116,42 @@ const WeightChunk = struct {
     const scale_capacity: usize = weights_capacity / 8;
     const output_capacity: usize = weights_capacity * 8;
 
-    buffer: [std.math.ceilPowerOfTwoPromote(usize, weights_capacity + scale_capacity + output_capacity)]u8 = undefined,
+    buffer: [math.floorPowerOfTwo(usize, weights_capacity + scale_capacity + output_capacity)]u8 = undefined,
     sequence: usize,
     input_byte_count: usize,
     output_byte_count: usize,
-    global_scale: usize,
+    global_scale: f32,
     step: enum { copy, decode },
 
-    fn create(allocator: mem.Allocator) !*WeightChunk {
-        const self: WeightChunk = try allocator.create(WeightChunk);
-        self.sequence = 0;
-        self.input_byte_count = 0;
-        self.output_byte_count = 0;
-        self.step = .copy;
-
-        return self;
+    inline fn weightsBytes(self: *WeightChunk) []u8 {
+        return self.buffer[0..self.input_byte_count];
     }
 
-    fn destroy(self: *WeightChunk, allocator: mem.Allocator) void {
-        allocator.destroy(self);
+    inline fn localScaleBytes(self: *WeightChunk) []u8 {
+        const start = weights_capacity;
+        const end = start + self.input_byte_count / 8;
+        return self.buffer[start..end];
     }
 
-    inline fn weightsBytes(self: *const WeightChunk) [weights_capacity]u8 {
-        return self.buffer[0..weights_capacity][0..self.input_byte_count];
-    }
-
-    inline fn localScaleBytes(self: *const WeightChunk) [weights_capacity]u8 {
-        return self.buffer[weights_capacity..scale_capacity][0 .. self.input_byte_count >> 4];
-    }
-
-    inline fn outputBytes(self: *const WeightChunk) []u8 {
+    inline fn outputBytes(self: *WeightChunk) []u8 {
         return self.buffer[weights_capacity + scale_capacity ..][0..self.output_byte_count];
     }
 
-    pub fn prepareChunckForDequant(self: *WeightChunk, seq: usize, input_byte_count: usize, global_scale: f32) void {
+    pub fn prepareChunkForDequant(self: *WeightChunk, seq: usize, input_byte_count: usize, global_scale: f32) void {
         std.debug.assert(input_byte_count <= weights_capacity);
-        std.debug.asset((input_byte_count & 7) == 0);
+        std.debug.assert((input_byte_count & 7) == 0);
 
         self.sequence = seq;
         self.input_byte_count = input_byte_count;
-        self.output_byte_count = input_byte_count << (4); // for f32
+        self.output_byte_count = input_byte_count << 3;
         self.step = .decode;
         self.global_scale = global_scale;
     }
-    pub fn prepareChunckForCopy(self: *WeightChunk, seq: usize, output_byte_count: usize, global_scale: f32) void {
+    pub fn prepareChunkForCopy(self: *WeightChunk, seq: usize, output_byte_count: usize, global_scale: f32) void {
         std.debug.assert(output_byte_count <= output_capacity);
-        std.debug.asset((output_byte_count & 7) == 0);
 
         self.sequence = seq;
+        self.input_byte_count = 0;
         self.output_byte_count = output_byte_count;
         self.step = .copy;
         self.global_scale = global_scale;
@@ -217,22 +205,26 @@ const WeightChunk = struct {
     };
 };
 
-fn decodeWeightChunck(chunck: *WeightChunk) void {
-    std.debug.assert(chunck.step == .decode);
-    const weights_bvte = chunck.weightsBytes();
-    const local_scales = chunck.localScaleBytes();
-    const output_bytes = chunck.outputBytes();
+fn decodeWeightChunk(chunk: *WeightChunk) void {
+    std.debug.assert(chunk.step == .decode);
+    const weights_bvte = chunk.weightsBytes();
+    const local_scales = chunk.localScaleBytes();
+    const output_bytes = chunk.outputBytes();
 
-    const weights_chunck_size: usize = @sizeOf(Nvfp4.PackedWeights);
-    const decoded_chunck_size: usize = @sizeOf(Nvfp4.DecodedWeights);
+    const weights_chunk_size: usize = @sizeOf(Nvfp4.PackedWeights);
+    const decoded_chunk_size: usize = @sizeOf(Nvfp4.DecodedWeights);
+
+    std.debug.assert(weights_bvte.len % weights_chunk_size == 0);
+    std.debug.assert(local_scales.len == weights_bvte.len / weights_chunk_size);
+    std.debug.assert(output_bytes.len == local_scales.len * decoded_chunk_size);
 
     for (local_scales, 0..) |local_scale, weight_index| {
-        const weight_start = weight_index * weights_chunck_size;
-        const decoded_start = weight_index * decoded_chunck_size;
+        const weight_start = weight_index * weights_chunk_size;
+        const decoded_start = weight_index * decoded_chunk_size;
 
-        const weights: Nvfp4.PackedWeights = weights_bvte[weight_start..][0..weights_chunck_size];
-        const decoded = Nvfp4.decodePackedWeights(weights, local_scale, chunck.global_scale);
-        const output_block = output_bytes[decoded_start..][0..decoded_chunck_size];
+        const weights: Nvfp4.PackedWeights = weights_bvte[weight_start..][0..weights_chunk_size].*;
+        const decoded = Nvfp4.decodePackedWeights(weights, local_scale, chunk.global_scale);
+        const output_block = output_bytes[decoded_start..][0..decoded_chunk_size];
 
         for (decoded, 0..) |value, index| {
             const byte_index = index * @sizeOf(f32);
@@ -241,22 +233,22 @@ fn decodeWeightChunck(chunck: *WeightChunk) void {
     }
 }
 
-fn decodeWeightChunckWorker(io: std.Io, pool: *WeightChunk.Pool) Io.Cancelable!void {
+fn decodeWeightChunkWorker(io: std.Io, pool: *WeightChunk.Pool) Io.Cancelable!void {
     while (true) {
-        const chunck = pool.being_decoded_queue.getOne(io) catch |err| {
+        const chunk = pool.being_decoded_queue.getOne(io) catch |err| {
             return switch (err) {
                 error.Canceled => Io.recancel(io),
                 error.Closed => {},
             };
         };
 
-        decodeWeightChunck(chunck);
+        decodeWeightChunk(chunk);
 
-        pool.processed_queue.putOne(io, chunck) catch |err| {
-            switch (err) {
+        pool.processed_queue.putOne(io, chunk) catch |err| {
+            return switch (err) {
                 error.Closed => {},
                 error.Canceled => Io.recancel(io),
-            }
+            };
         };
     }
 }
@@ -274,8 +266,6 @@ pub fn dequantNvfp4(
     var chunk_pool: WeightChunk.Pool = undefined;
     try chunk_pool.init(allocator, io);
     defer chunk_pool.deinit(allocator, io);
-
-    try decodeWeightChunckWorker(io, &chunk_pool);
 
     const runtime_weights = try allocator.alloc(
         RuntimeWeight,
