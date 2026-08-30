@@ -171,8 +171,13 @@ const WeightChunk = struct {
         being_decoded_queue: Io.Queue(*WeightChunk),
         processed_queue: Io.Queue(*WeightChunk),
 
+        error_mutex: Io.Mutex,
+        first_error: ?anyerror,
+
         pub fn init(pool: *WeightChunk.Pool, allocator: mem.Allocator, io: Io) !void {
             pool.used_count = 0;
+            pool.error_mutex = .init;
+            pool.first_error = null;
 
             pool.available_queue = .init(&pool.chunks_available);
             pool.being_decoded_queue = .init(&pool.chunks_being_decoded);
@@ -192,6 +197,29 @@ const WeightChunk = struct {
                 try pool.available_queue.putOne(io, chunk);
                 pool.used_count += 1;
             }
+        }
+
+        // this function is idempotent, the goal is just to avoid one error
+        // blocking the other queues indefinitely if something wrong happened
+        pub fn fail(pool: *WeightChunk.Pool, io: Io, err: anyerror) void {
+            pool.error_mutex.lockUncancelable(io);
+
+            if (pool.first_error == null) {
+                pool.first_error = err;
+            }
+
+            pool.error_mutex.unlock(io);
+
+            pool.available_queue.close(io);
+            pool.being_decoded_queue.close(io);
+            pool.processed_queue.close(io);
+        }
+
+        pub fn getError(pool: *WeightChunk.Pool, io: Io) ?anyerror {
+            pool.error_mutex.lockUncancelable(io);
+            defer pool.error_mutex.unlock(io);
+
+            return pool.first_error;
         }
 
         pub fn deinit(pool: *WeightChunk.Pool, allocator: mem.Allocator, io: Io) void {
@@ -274,11 +302,20 @@ fn orderWriteWorker(io: std.Io, writer: *Io.Writer, pool: *WeightChunk.Pool) !vo
             const next_chunk = pending_chunks_ring_buffer[expected_index] orelse break;
             std.debug.assert(next_chunk.sequence == expected_sequence);
 
-            try writer.writeAll(next_chunk.outputBytes());
+            writer.writeAll(next_chunk.outputBytes()) catch |err| {
+                pool.fail(io, err);
+                return err;
+            };
+
             pending_chunks_ring_buffer[expected_index] = null;
             expected_sequence += 1;
 
-            try pool.available_queue.putOne(io, next_chunk);
+            pool.available_queue.putOne(io, next_chunk) catch |err| {
+                switch (err) {
+                    error.Closed => break,
+                    error.Canceled => return Io.recancel(io),
+                }
+            };
         }
 
         // for (pending_chunks_ring_buffer) |c| {
@@ -286,7 +323,10 @@ fn orderWriteWorker(io: std.Io, writer: *Io.Writer, pool: *WeightChunk.Pool) !vo
         // }
     }
 
-    try writer.flush();
+    writer.flush() catch |err| {
+        pool.fail(io, err);
+        return err;
+    };
 }
 
 pub fn dequantNvfp4(
@@ -302,6 +342,32 @@ pub fn dequantNvfp4(
     var chunk_pool: WeightChunk.Pool = undefined;
     try chunk_pool.init(allocator, io);
     defer chunk_pool.deinit(allocator, io);
+
+    var writer_done = false;
+    var worker_done = false;
+
+    var writer_future = try io.concurrent(quantization.orderWriteWorker, .{ io, writer, &chunk_pool });
+    var worker_group: Io.Group = .init;
+
+    for (0..4) |_| {
+        try worker_group.concurrent(io, quantization.decodeWeightChunkWorker, .{ io, &chunk_pool });
+    }
+
+    defer {
+        if (!worker_done or !writer_done) {
+            chunk_pool.available_queue.close(io);
+            chunk_pool.being_decoded_queue.close(io);
+            chunk_pool.processed_queue.close(io);
+
+            if (!worker_done) {
+                worker_group.cancel(io);
+            }
+
+            if (!writer_done) {
+                _ = writer_future.cancel(io) catch {};
+            }
+        }
+    }
 
     const runtime_weights = try allocator.alloc(
         RuntimeWeight,
@@ -391,6 +457,20 @@ pub fn dequantNvfp4(
         }
 
         input_offset = tensor_end;
+    }
+
+    chunk_pool.being_decoded_queue.close(io);
+
+    try worker_group.await(io);
+    worker_done = true;
+
+    chunk_pool.processed_queue.close(io);
+
+    try writer_future.await(io);
+    writer_done = true;
+
+    if (chunk_pool.getError(io)) |err| {
+        return err;
     }
 }
 
