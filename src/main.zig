@@ -88,7 +88,7 @@ pub fn main(init: process.Init.Minimal) !void {
         return;
     };
 
-    quantization.dequantNvfp4(allocator, &reader.interface, &output_file_wrttier.interface, parsed_safetensor.values.slice(), &weigths) catch |err| {
+    quantization.dequantNvfp4(allocator, io, &reader.interface, &output_file_wrttier.interface, parsed_safetensor.values.slice(), &weigths) catch |err| {
         log.err("{}", .{err});
         return;
     };

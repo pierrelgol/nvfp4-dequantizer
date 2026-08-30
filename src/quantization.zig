@@ -10,7 +10,7 @@ const log = std.log;
 const Cli = @import("Cli.zig");
 const safetensors = @import("safetensors.zig");
 const Weights = @import("Weights.zig");
-const quantization = @import("quantization.zig");
+pub const quantization = @This();
 const Benchmark = @import("utils.zig").Benchmark;
 const options = @import("options");
 
@@ -103,21 +103,23 @@ const RuntimeWeight = struct {
     global_scale: ?f32 = null,
 
     fn deinit(self: *RuntimeWeight, allocator: mem.Allocator) void {
+        defer self.* = undefined;
+
         if (self.local_scales) |scales| {
             allocator.free(scales);
         }
-
-        self.* = undefined;
     }
 };
 
 pub fn dequantNvfp4(
     allocator: mem.Allocator,
+    io: std.Io,
     reader: *Io.Reader,
     writer: *Io.Writer,
     tensors: std.MultiArrayList(safetensors.MetaData).Slice,
     weights: *const Weights,
 ) !void {
+    @branchHint(.likely);
     std.debug.assert(weights.steps.len == tensors.len);
 
     const runtime_weights = try allocator.alloc(
@@ -185,6 +187,7 @@ pub fn dequantNvfp4(
                 );
             },
             .dequantize => |weight_index| {
+                @branchHint(.likely);
                 std.debug.assert(weight_index < runtime_weights.len);
 
                 const runtime_weight = &runtime_weights[weight_index];
@@ -192,6 +195,7 @@ pub fn dequantNvfp4(
                 const global_scale = runtime_weight.global_scale.?;
 
                 try dequantizeNvpf4Tensor(
+                    io,
                     reader,
                     writer,
                     tensor_size,
@@ -208,13 +212,8 @@ pub fn dequantNvfp4(
     }
 }
 
-pub fn readLocalScales(
-    allocator: mem.Allocator,
-    reader: *Io.Reader,
-    byte_len: u64,
-) ![]u8 {
-    const len = math.cast(usize, byte_len) orelse
-        return error.TensorTooLarge;
+pub fn readLocalScales(allocator: mem.Allocator, reader: *Io.Reader, byte_len: u64) ![]u8 {
+    const len = math.cast(usize, byte_len) orelse unreachable;
 
     if (options.debug) {
         std.debug.print("readLocalScales len = {d}", .{len});
@@ -229,12 +228,14 @@ pub fn readLocalScales(
 }
 
 pub fn dequantizeNvpf4Tensor(
+    io: std.Io,
     reader: *Io.Reader,
     writer: *Io.Writer,
     weights_byte_size: u64,
     local_scales: []const u8,
     global_scale: f32,
 ) !void {
+    _ = io;
     const weights_blokc_size = @sizeOf(quantization.Nvfp4.PackedWeights);
 
     std.debug.assert(weights_byte_size % weights_blokc_size == 0);
@@ -288,9 +289,7 @@ fn discardExactTensor(reader: *Io.Reader, cursor_position: *u64, tensor_start: u
 }
 
 fn readGlobalScale(reader: *Io.Reader, global_scale_size: u64) !f32 {
-    if (global_scale_size != @sizeOf(f32)) {
-        return error.InvalidGlobalScaleLength;
-    }
+    std.debug.assert(global_scale_size == @sizeOf(f32));
 
     const global_scale_bits = try reader.takeInt(u32, .little);
     const result: f32 = @bitCast(global_scale_bits);
