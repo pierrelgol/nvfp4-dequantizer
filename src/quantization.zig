@@ -170,39 +170,49 @@ const WeightChunk = struct {
     }
 
     pub const Pool = struct {
-        const number_of_chunks = 16;
+        const number_of_chunks: usize = 16;
 
         used_count: usize,
-        used_chunks: [number_of_chunks]*WeightChunk,
-        free_chunks: [number_of_chunks]*WeightChunk,
-        queue: Io.Queue(*WeightChunk),
+        backing_chunks_slice: []WeightChunk,
 
-        pub fn init(pool: *WeightChunk.Pool, allocator: mem.Allocator, io: std.Io) !void {
-            pool.queue = .init(&pool.free_chunks);
-            pool.used_chunks = 0;
+        chunks_available: [number_of_chunks]*WeightChunk,
+        chunks_being_decoded: [number_of_chunks]*WeightChunk,
+        chunks_processed: [number_of_chunks]*WeightChunk,
+
+        available_queue: Io.Queue(*WeightChunk),
+        being_decoded_queue: Io.Queue(*WeightChunk),
+        processed_queue: Io.Queue(*WeightChunk),
+
+        pub fn init(pool: *WeightChunk.Pool, allocator: mem.Allocator, io: Io) !void {
+            pool.used_count = 0;
+
+            pool.available_queue = .init(&pool.chunks_available);
+            pool.being_decoded_queue = .init(&pool.chunks_being_decoded);
+            pool.processed_queue = .init(&pool.chunks_processed);
+
+            pool.backing_chunks_slice = try allocator.alloc(WeightChunk, number_of_chunks);
 
             errdefer {
-                pool.queue.close(io);
+                pool.available_queue.close(io);
+                pool.being_decoded_queue.close(io);
+                pool.processed_queue.close(io);
 
-                for (pool.used_chunks[0..pool.used_count]) |chunk| {
-                    chunk.destroy(allocator);
-                }
+                allocator.free(pool.backing_chunks_slice);
             }
 
-            for (0..number_of_chunks) |i| {
-                pool.used_chunks[i] = try WeightChunk.create(allocator);
-                pool.used_chunks += 1;
-                try pool.queue.putOne(io, pool.used_chunks[i]);
+            for (pool.backing_chunks_slice) |*chunk| {
+                try pool.available_queue.putOne(io, chunk);
+                pool.used_count += 1;
             }
         }
 
-        pub fn deinit(pool: *WeightChunk.Pool, allocator: mem.Allocator, io: std.Io) void {
+        pub fn deinit(pool: *WeightChunk.Pool, allocator: mem.Allocator, io: Io) void {
             defer pool.* = undefined;
-            pool.queue.close(io);
+            pool.available_queue.close(io);
+            pool.being_decoded_queue.close(io);
+            pool.processed_queue.close(io);
 
-            for (pool.used_chunks[0..pool.used_count]) |chunk| {
-                chunk.destroy(allocator);
-            }
+            allocator.free(pool.backing_chunks_slice);
         }
     };
 };
