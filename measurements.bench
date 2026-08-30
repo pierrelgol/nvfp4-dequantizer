@@ -1,0 +1,12 @@
+parse arguments: 521ns
+open input: 6.543us
+parse safetensors: 290.866us
+build tensor map: 79.314us
+associate NVFP4 weights: 29.958us
+build dispatch list: 6.713us
+build output metadata: 56.77us
+open output: 47.449ms
+write output header: 153.96us
+convert: 361.308ms, 1022.6071701049805MiB, 2830.29 MiB/s
+flush: 13.757us, 1022.6071701049805MiB, 74333588.00 MiB/s
+total: 409.473ms, 1022.6451721191406MiB, 2497.46 MiB/s
