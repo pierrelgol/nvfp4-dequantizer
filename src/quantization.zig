@@ -35,10 +35,94 @@ pub const Format = enum {
 /// source that helped : https://github.com/pytorch/pytorch/blob/main/torch/headeronly/util/Float8_e4m3fn.h
 /// also this is peak: https://github.com/ggml-org/ggml/blob/master/src/ggml-quants.c#L589
 /// and of course this : https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/
+/// https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-cpu/ggml-cpu.c#L86
+/// https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-cpu/ggml-cpu.c#L3857-L3860
+/// llama.cpp/ggml/src/ggml-common.h
+/// llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c
+/// llama.cpp/ggml/src/ggml-cpu/simd-mappings.h
 pub const Nvfp4 = struct {
     pub const total_packed_weights: usize = 16;
     pub const PackedWeights = [total_packed_weights >> 1]u8; // 8 * u4 = 16 u4 in E2m1
     pub const DecodedWeights = [total_packed_weights]f32;
+
+    // E2M1 and UE4M3 lookup tables derived from llama.cpp/ggml:
+    // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-common.h#L1123-L1129
+    // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-impl.h#L500-L515
+    // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-cpu/ggml-cpu.c#L3857-L3860
+    pub const e2m1_lut: [16]i8 = generateE2M1Lut();
+    pub const e4m3_lut: [256]f32 = generateE4M3Lut();
+
+    fn generateE2M1Lut() [16]i8 {
+        var lut: [16]i8 = undefined;
+
+        for (0..lut.len) |index| {
+            const value: u8 = @intCast(index);
+            const exponent = (value >> 1) & 0b0011;
+            const mantissa = value & 0b1;
+            const sign = (value & 0b1000) != 0;
+
+            const magnitude: i8 =
+                if (exponent == 0)
+                    @intCast(mantissa)
+                else
+                    @as(i8, @intCast(2 + mantissa)) << @intCast(exponent - 1);
+            lut[index] = if (sign == true) -magnitude else magnitude;
+        }
+
+        return lut;
+    }
+
+    // from https://github.com/ggml-org/llama.cpp/blob/0190529ec450659b541ff608449401e68c27d098/ggml/src/ggml-impl.h#L502
+    //
+    /// UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
+    /// Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
+    ///static inline float ggml_ue4m3_to_fp32(uint8_t x) {
+    ///    if (x == 0 || x == 0x7F) {
+    ///        return 0.0f;
+    ///    }
+    ///    int   exp = (x >> 3) & 0xF;
+    ///    int   man = x & 0x7;
+    ///    float raw;
+    ///    if (exp == 0) {
+    ///        raw = ldexpf((float) man, -9);
+    ///    } else {
+    ///        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    ///    }
+    ///    return raw * 0.5f;
+    ///}
+    fn generateE4M3Lut() [256]f32 {
+        var lut: [256]f32 = undefined;
+
+        for (0..lut.len) |index| {
+            const code: u8 = @intCast(index);
+
+            if (code == 0 or code == 0x7f) {
+                lut[index] = 0.0;
+                continue;
+            }
+
+            const exponent: u8 = (code >> 3) & 0x0f;
+            const mantissa: u8 = code & 0x07;
+
+            var value: f32 = if (exponent == 0)
+                @as(f32, @floatFromInt(mantissa)) / 1024.0
+            else
+                1.0 + @as(f32, @floatFromInt(mantissa)) / 8.0;
+
+            if (exponent != 0) {
+                const power: i8 = @as(i8, @intCast(exponent)) - 8;
+
+                if (power >= 0) {
+                    for (0..@intCast(power)) |_| value *= 2.0;
+                } else {
+                    for (0..@intCast(-power)) |_| value *= 0.5;
+                }
+            }
+
+            lut[index] = value;
+        }
+        return lut;
+    }
 
     // TODO SIMD version
     pub fn decodePackedWeights(packed_weights: PackedWeights, scale: u8, weight_global_scale: f32) DecodedWeights {
