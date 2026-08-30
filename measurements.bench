@@ -10,3 +10,18 @@ write output header: 153.96us
 convert: 361.308ms, 1022.6071701049805MiB, 2830.29 MiB/s
 flush: 13.757us, 1022.6071701049805MiB, 74333588.00 MiB/s
 total: 409.473ms, 1022.6451721191406MiB, 2497.46 MiB/s
+
+// with simd
+
+parse arguments: 1.763us
+open input: 7.224us
+parse safetensors: 289.915us
+build tensor map: 73.212us
+associate NVFP4 weights: 30.068us
+build dispatch list: 6.563us
+build output metadata: 69.856us
+open output: 47.074ms
+write output header: 212.104us
+convert: 201.568ms, 1022.6071701049805MiB, 5073.25 MiB/s
+flush: 50ns, 1022.6071701049805MiB, 20452143402.10 MiB/s
+total: 249.382ms, 1022.6451721191406MiB, 4100.71 MiB/s
