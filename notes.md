@@ -110,4 +110,25 @@ fn buffered_write_to_file<V: View>(
 ```
 
 they use the same strategy as me to reduce memory usage whitch is to stream
-the decompressed output
+the decompressed output.
+
+they also use different types, then me for tensors, I have to dig a bit deeper
+it seems that their approach is to lazily load tensors, which mine doesn't do
+i guess because mine is optimized for a single file not for potentially a
+distributed system.
+
+they have a lot of tests so if I adapt them the tensor parsing should be solid.
+
+
+trying to also collect all the sources I've used to help me with the impl
+
+https://github.com/ingted/nvfp4_native/blob/master/libNVFP4.cpp
+https://github.com/r-chong/mxfp4-dequantizer
+https://github.com/foundation-model-stack/fastsafetensors
+
+
+found also a json schema for the safetensors format
+https://github.com/safetensors/safetensors/blob/main/docs/safetensors.schema.json
+
+ok I've gathered enough sources, I'll start designing a better architecture
+
