@@ -25,3 +25,19 @@ write output header: 212.104us
 convert: 201.568ms, 1022.6071701049805MiB, 5073.25 MiB/s
 flush: 50ns, 1022.6071701049805MiB, 20452143402.10 MiB/s
 total: 249.382ms, 1022.6451721191406MiB, 4100.71 MiB/s
+
+// at school on school computers (with a smaller model)
+
+nvfp4-dequantizer ) zbor
+parse arguments: 3.731us
+open input: 7.295us
+parse safetensors: 153.171us
+build tensor map: 33.256us
+associate NVFP4 weights: 531ns
+build dispatch list: 4.175us
+build output metadata: 37.537us
+open output: 933.05us
+write output header: 98.326us
+convert: 8.2ms, 37.11577033996582MiB, 4526.10 MiB/s
+flush: 46ns, 37.11577033996582MiB, 806864572.61 MiB/s
+total: 9.526ms, 37.126413345336914MiB, 3897.27 MiB/s
