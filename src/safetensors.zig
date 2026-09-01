@@ -91,11 +91,7 @@ pub fn parse(allocator: mem.Allocator, reader: *Io.Reader) !safetensors.Result {
             continue;
         }
 
-        const pre = try json_reader.peekNextTokenType();
-        const parsed = json.innerParse(Tensor.Info, arena, &json_reader, options) catch |err| {
-            std.debug.print("{s}\n", .{@tagName(pre)});
-            return err;
-        };
+        const parsed = try json.innerParse(Tensor.Info, arena, &json_reader, options);
 
         if (parsed.data_offsets[0] > parsed.data_offsets[1]) {
             return error.InvalidTensorOffsets;
