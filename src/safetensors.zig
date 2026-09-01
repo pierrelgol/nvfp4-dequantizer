@@ -11,6 +11,7 @@ pub const Error = error{
     InvalidHeaderContent,
     InvalidTensorOffsets,
     DuplicateTensorName,
+    InacurateHeaderSize,
 };
 
 pub const Header = struct {
@@ -104,6 +105,10 @@ pub fn parse(allocator: mem.Allocator, reader: *Io.Reader) !safetensors.Result {
         } else {
             gop.value_ptr.* = parsed;
         }
+    }
+
+    if (limited_reader.remaining.nonzero()) {
+        return error.InacurateHeaderSize;
     }
 
     return result;
