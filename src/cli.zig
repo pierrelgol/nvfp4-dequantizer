@@ -14,7 +14,7 @@ pub const Result = struct {
         self: @This(),
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
-        try json.Stringify.value(self, .{ .whitespace = .indent_4 }, writer);
+        try json.Stringify.value(self, .{ .whitespace = .minified }, writer);
     }
 };
 

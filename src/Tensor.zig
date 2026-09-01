@@ -1,13 +1,21 @@
 const std = @import("std");
+const json = std.json;
 pub const Tensor = @This();
 
-const Map = std.StringArrayHashMapUnmanaged;
-pub const Metadata = std.StringArrayHashMapUnmanaged;
+pub const Map = json.ArrayHashMap(Tensor.Info);
+pub const Metadata = json.ArrayHashMap([]const u8);
 
 pub const Info = struct {
     dtype: Dtype,
     shape: Shape,
     data_offsets: DataOffsets,
+
+    pub fn format(
+        self: @This(),
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try std.json.Stringify.value(self, .{ .whitespace = .minified }, writer);
+    }
 };
 
 pub const Shape = []u64;
@@ -59,6 +67,11 @@ pub const Dtype = enum {
     I64,
     // Unsigned integer (64-bit)
     U64,
-    // Unsigned integer (4bits)
-    F4_E2M1,
+
+    pub fn format(
+        self: @This(),
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        std.json.Stringify.value(self, .{ .whitespace = .minified }, writer);
+    }
 };

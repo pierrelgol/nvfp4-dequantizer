@@ -5,6 +5,7 @@ const heap = std.heap;
 const log = std.log;
 const process = std.process;
 const cli = @import("cli.zig");
+const safetensors = @import("safetensors.zig");
 
 pub const input_reader_buffer_size: usize = 64 * 1024;
 pub const output_writer_buffer_size: usize = 256 * 1024;
@@ -43,6 +44,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var output_file_writer: Io.File.Writer = .init(output_file, io, &output_file_writer_buffer);
     const writer: *Io.Writer = &output_file_writer.interface;
 
-    _ = reader;
+    var stdout_writer_buffer: [4096]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_writer_buffer);
+    const stdout = &stdout_writer.interface;
+
     _ = writer;
+    var parsed_tensors = try safetensors.parse(gpa, reader);
+    defer parsed_tensors.deinit();
+
+    try stdout.print("{f}\n", .{parsed_tensors.header});
+    try stdout.flush();
 }
