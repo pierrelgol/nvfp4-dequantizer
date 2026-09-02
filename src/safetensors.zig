@@ -287,11 +287,7 @@ pub fn buildDequantizedHeader(
     return result;
 }
 
-pub fn writeHeader(
-    allocator: mem.Allocator,
-    header: *const Header,
-    writer: *Io.Writer,
-) !u64 {
+pub fn writeHeader(allocator: mem.Allocator, header: *const Header, writer: *Io.Writer) !u64 {
     var allocating: Io.Writer.Allocating = .init(allocator);
     defer allocating.deinit();
 
@@ -299,18 +295,22 @@ pub fn writeHeader(
         .writer = &allocating.writer,
         .options = .{},
     };
+
     try stringify.beginObject();
     const tensors = header.tensors.slice();
+
     for (0..tensors.len) |index| {
         const tensor = tensors.get(index);
         try stringify.objectField(tensor.name);
         try stringify.write(tensor.info);
     }
+
     try stringify.endObject();
 
     const json_bytes = allocating.writer.buffered();
     const padding = (8 - (json_bytes.len % 8)) % 8;
     const header_size = json_bytes.len + padding;
+
     if (header_size > Header.maximum_header_size) {
         return error.InvalidHeaderSize;
     }
@@ -318,5 +318,60 @@ pub fn writeHeader(
     try writer.writeInt(u64, @intCast(header_size), .little);
     try writer.writeAll(json_bytes);
     try writer.splatByteAll(' ', padding);
+
     return @sizeOf(u64) + header_size;
+}
+
+// Adapted from huggingface/safetensors safetensors/src/tensor.rs.
+test "parses a normal header" {
+    const serialized = "\x3c\x00\x00\x00\x00\x00\x00\x00{\"test\":{\"dtype\":\"I32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    var reader: Io.Reader = .fixed(serialized);
+
+    var parsed = try parse(std.testing.allocator, &reader);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.header.tensors.len);
+    const tensor = parsed.header.tensors.get(0);
+    try std.testing.expectEqualStrings("test", tensor.name);
+    try std.testing.expectEqual(Tensor.Dtype.I32, tensor.info.dtype);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 2 }, tensor.info.shape);
+    try std.testing.expectEqual(Tensor.DataOffsets{ 0, 16 }, tensor.info.data_offsets);
+}
+
+// Adapted from huggingface/safetensors safetensors/src/tensor.rs.
+test "rejects an oversized header" {
+    const serialized = "\x3c\x00\x00\x00\x00\xff\xff\xff";
+    var reader: Io.Reader = .fixed(serialized);
+
+    try std.testing.expectError(
+        error.InvalidHeaderSize,
+        parse(std.testing.allocator, &reader),
+    );
+}
+
+// Adapted from huggingface/safetensors safetensors/src/tensor.rs.
+test "accepts a whitespace-padded header" {
+    const serialized = "\x06\x00\x00\x00\x00\x00\x00\x00{}\x0d\x20\x09\x0a";
+    var reader: Io.Reader = .fixed(serialized);
+
+    var parsed = try parse(std.testing.allocator, &reader);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.header.tensors.len);
+}
+
+// Adapted from huggingface/safetensors safetensors/src/tensor.rs.
+test "accepts a zero-sized tensor" {
+    const serialized = "\x3b\x00\x00\x00\x00\x00\x00\x00{\"test\":{\"dtype\":\"I32\",\"shape\":[2,0],\"data_offsets\":[0,0]}}";
+    var reader: Io.Reader = .fixed(serialized);
+
+    var parsed = try parse(std.testing.allocator, &reader);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.header.tensors.len);
+    const tensor = parsed.header.tensors.get(0);
+    try std.testing.expectEqualStrings("test", tensor.name);
+    try std.testing.expectEqual(Tensor.Dtype.I32, tensor.info.dtype);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 0 }, tensor.info.shape);
+    try std.testing.expectEqual(Tensor.DataOffsets{ 0, 0 }, tensor.info.data_offsets);
 }

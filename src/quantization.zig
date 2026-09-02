@@ -226,7 +226,14 @@ pub const Dequantizer = struct {
         }
     }
 };
-
+/// source that helped : https://github.com/pytorch/pytorch/blob/main/torch/headeronly/util/Float8_e4m3fn.h
+/// also this is peak: https://github.com/ggml-org/ggml/blob/master/src/ggml-quants.c#L589
+/// and of course this : https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/
+/// https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-cpu/ggml-cpu.c#L86
+/// https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-cpu/ggml-cpu.c#L3857-L3860
+/// llama.cpp/ggml/src/ggml-common.h
+/// llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c
+/// llama.cpp/ggml/src/ggml-cpu/simd-mappings.h
 pub const Nvfp4 = struct {
     pub const packed_count: usize = 16;
     pub const PackedWeights = [packed_count / 2]u8;
@@ -243,7 +250,29 @@ pub const Nvfp4 = struct {
         0, -1, -2, -3, -4, -6, -8, -12,
     };
 
-    /// UE4M3 * 0.5 so the LUT matches kvalues_mxfp4 (2 * E2M1).
+    // E2M1 and UE4M3 lookup tables derived from llama.cpp/ggml:
+    // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-common.h#L1123-L1129
+    // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-impl.h#L500-L515
+    // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-cpu/ggml-cpu.c#L3857-L3860
+    //      from https://github.com/ggml-org/llama.cpp/blob/0190529ec450659b541ff608449401e68c27d098/ggml/src/ggml-impl.h#L502
+    //
+    // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
+    // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
+    //static inline float ggml_ue4m3_to_fp32(uint8_t x) {
+    //    if (x == 0 || x == 0x7F) {
+    //        return 0.0f;
+    //    }
+    //    int   exp = (x >> 3) & 0xF;
+    //    int   man = x & 0x7;
+    //    float raw;
+    //    if (exp == 0) {
+    //        raw = ldexpf((float) man, -9);
+    //    } else {
+    //        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    //    }
+    //    return raw * 0.5f;
+    //}
+    // UE4M3 * 0.5 so the LUT matches kvalues_mxfp4 (2 * E2M1).
     pub const e4m3_lut: [256]f32 = lut: {
         @setEvalBranchQuota(100000);
         var values: [256]f32 = undefined;
@@ -534,9 +563,42 @@ test "NVFP4 SIMD decode matches every E2M1 code" {
         0x10, 0x32, 0x54, 0x76,
         0x98, 0xba, 0xdc, 0xfe,
     };
+
     const decoded = Nvfp4.decodePackedWeights(packed_weights, 0x40, 1.0);
+
     for (decoded, Nvfp4.e2m1_lut) |actual, expected_integer| {
         try std.testing.expectEqual(@as(f32, @floatFromInt(expected_integer)), actual);
     }
+
     try std.testing.expectEqual(@as(u32, 0x8000_0000), @as(u32, @bitCast(decoded[8])));
+}
+
+test "NVFP4 applies local and global scales" {
+    const packed_weights: Nvfp4.PackedWeights = @splat(0x11);
+
+    const decoded = Nvfp4.decodePackedWeights(
+        packed_weights,
+        0x48,
+        0.25,
+    );
+
+    for (decoded) |value| {
+        try std.testing.expectEqual(@as(f32, 0.5), value);
+    }
+}
+
+test "E4M3 lookup has expected basic values" {
+    try std.testing.expectEqual(@as(f32, 0), Nvfp4.e4m3_lut[0]);
+    try std.testing.expectEqual(@as(f32, 0), Nvfp4.e4m3_lut[0x7f]);
+    try std.testing.expectEqual(@as(f32, 1), Nvfp4.e4m3_lut[0x40]);
+    try std.testing.expectEqual(@as(f32, 2), Nvfp4.e4m3_lut[0x48]);
+}
+
+test "dequantizer rejects unsupported conversions" {
+    var dequantizer: Dequantizer = undefined;
+
+    try std.testing.expectError(
+        error.UnsupportedConversion,
+        dequantizer.dequantize(.f32, .f32),
+    );
 }
