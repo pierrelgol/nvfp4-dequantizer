@@ -22,6 +22,7 @@ pub const Header = struct {
     tensors: std.MultiArrayList(Tensor) = .empty,
     tensor_index: std.StringArrayHashMapUnmanaged(Tensor.Index) = .empty,
     tensor_units: std.StringArrayHashMapUnmanaged(Tensor.Unit) = .empty,
+    tensor_operations: std.ArrayListUnmanaged(Tensor.Operation) = .empty,
     metadata: ?Tensor.Metadata = null,
 
     pub const maximum_header_size = 100 * 1024 * 1024;
@@ -98,6 +99,19 @@ pub const Header = struct {
                 };
             }
         }
+    }
+
+    fn indexTensorsByoperation(header: *safetensors.Header, allocator: mem.Allocator) !void {
+        var operations = try allocator.alloc(Tensor.Operation, header.tensor_index.entries.len);
+        @memset(operations, Tensor.Operation.copy);
+
+        var i: usize = 0;
+        var it = header.tensor_units.iterator();
+        while (it.next()) |entry| : (i += 1) {
+            operations[i] = Tensor.Operation.operationFromTensorName(entry.key_ptr.*) orelse .copy;
+        }
+
+        header.tensor_operations = .initBuffer(operations);
     }
 };
 
@@ -186,6 +200,7 @@ pub fn parse(allocator: mem.Allocator, reader: *Io.Reader) !safetensors.Result {
     result.header.sortTensorsByDataOffsets();
     try result.header.indexTensorsByName(arena);
     try result.header.indexTensorsByUnit(arena);
+    try result.header.indexTensorsByoperation(arena);
 
     return result;
 }

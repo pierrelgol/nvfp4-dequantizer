@@ -30,6 +30,20 @@ pub const Info = struct {
     }
 };
 
+pub const Operation = enum {
+    copy,
+    cache_local,
+    cache_global,
+    dequantize,
+    quantize,
+
+    pub fn operationFromTensorName(name: []const u8) ?Operation {
+        return ops.get(name);
+    }
+
+    const ops = std.StaticStringMap(Tensor.Operation).initEnum();
+};
+
 pub const Unit = struct {
     index_of_weights: usize,
     index_of_local_scale: usize,
