@@ -28,8 +28,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.addFileArg2(b.path("./models/sembr2023-bert-small-nvfp4/model.safetensors"), .{ .make_absolute = true });
-    run_cmd.addFileArg2(b.path("./models/sembr2023-bert-small-nvfp4/model.safetensors.f32"), .{ .make_absolute = true });
+    run_cmd.addFileArg2(b.path("./models/gemma-3-270m-it-NVFP4/model.safetensors"), .{ .make_absolute = true });
+    run_cmd.addFileArg2(b.path("./models/gemma-3-270m-it-NVFP4/model.safetensors.f32"), .{ .make_absolute = true });
 
     run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
