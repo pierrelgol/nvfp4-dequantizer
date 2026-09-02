@@ -1,25 +1,25 @@
 const std = @import("std");
 
-pub const Benchmark = struct {
+pub const Timer = struct {
     name: []const u8,
     started: std.Io.Timestamp,
     elapsed_ns: u64 = 0,
     bytes: ?u64 = null,
 
-    pub fn start(name: []const u8, io: std.Io) Benchmark {
+    pub fn start(name: []const u8, io: std.Io) Timer {
         return .{
             .name = name,
             .started = std.Io.Clock.now(.awake, io),
         };
     }
 
-    pub fn stop(self: *Benchmark, io: std.Io, bytes: ?u64) void {
+    pub fn stop(self: *Timer, io: std.Io, bytes: ?u64) void {
         self.elapsed_ns = @intCast(self.started.untilNow(io, .awake).nanoseconds);
         self.bytes = bytes;
         std.debug.print("{f}\n", .{self.*});
     }
 
-    pub fn format(self: Benchmark, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn format(self: Timer, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("{s}: {f}", .{
             self.name,
             std.Io.Duration.fromNanoseconds(self.elapsed_ns),

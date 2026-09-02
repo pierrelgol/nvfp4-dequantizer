@@ -1,14 +1,26 @@
 const std = @import("std");
 const json = std.json;
 pub const Tensor = @This();
-
-pub const Map = json.ArrayHashMap(Tensor.Info);
 pub const Metadata = json.ArrayHashMap([]const u8);
+pub const Index = usize;
+
+sequence: usize = 0,
+name: []const u8 = "",
+info: Info = .{},
+
+pub const init: Tensor = .{};
+
+pub fn format(
+    self: @This(),
+    writer: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    try writer.print("{f}", .{self.info});
+}
 
 pub const Info = struct {
-    dtype: Dtype,
-    shape: Shape,
-    data_offsets: DataOffsets,
+    dtype: Dtype = .none,
+    shape: Shape = &.{},
+    data_offsets: DataOffsets = @splat(0),
 
     pub fn format(
         self: @This(),
@@ -18,11 +30,18 @@ pub const Info = struct {
     }
 };
 
+pub const Unit = struct {
+    index_of_weights: usize,
+    index_of_local_scale: usize,
+    index_of_global_scale: usize,
+};
+
 pub const Shape = []u64;
 pub const DataOffsets = [2]u64;
 
 /// stolen from safetensors/lib/tensor.rs
 pub const Dtype = enum {
+    none,
     // Boolan type
     BOOL,
     // MXF4 <https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf>_
