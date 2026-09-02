@@ -115,13 +115,13 @@ pub const Header = struct {
     }
 };
 
-pub const Result = struct {
+pub const ParsedHeader = struct {
     arena: heap.ArenaAllocator,
     header: safetensors.Header,
     header_size: u64 = 0,
     tensors_start_offset: u64 = 0,
 
-    pub fn init(allocator: mem.Allocator, header_size: u64) Result {
+    pub fn init(allocator: mem.Allocator, header_size: u64) ParsedHeader {
         return .{
             .arena = .init(allocator),
             .header = .{},
@@ -130,20 +130,20 @@ pub const Result = struct {
         };
     }
 
-    pub fn deinit(self: *Result) void {
+    pub fn deinit(self: *ParsedHeader) void {
         defer self.* = undefined;
         self.arena.deinit();
     }
 };
 
-pub fn parse(allocator: mem.Allocator, reader: *Io.Reader) !safetensors.Result {
+pub fn parse(allocator: mem.Allocator, reader: *Io.Reader) !safetensors.ParsedHeader {
     const header_size = try reader.takeInt(u64, .little);
 
     if (header_size > Header.maximum_header_size) {
         return error.InvalidHeaderSize;
     }
 
-    var result: Result = .init(allocator, header_size);
+    var result: ParsedHeader = .init(allocator, header_size);
     errdefer result.deinit();
     const arena = result.arena.allocator();
 
