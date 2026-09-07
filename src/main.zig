@@ -7,8 +7,6 @@ const process = std.process;
 
 const cli = @import("cli.zig");
 const utils = @import("utils.zig");
-const safetensors = @import("safetensors.zig");
-const quantization = @import("quantization.zig");
 
 pub const input_reader_buffer_size: usize = 64 * 1024;
 pub const output_writer_buffer_size: usize = 64 * 1024;
@@ -51,42 +49,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     );
     const writer: *Io.Writer = &output_file_writer.interface;
 
-    var p0 = utils.Timer.start("safetensor parsing", io);
-    var parsed_tensors = try safetensors.parse(gpa, reader);
-    defer parsed_tensors.deinit();
-    p0.stop(io, parsed_tensors.tensors_start_offset);
-
-    var p1 = utils.Timer.start("build output header", io);
-    var output_header = try safetensors.buildDequantizedHeader(
-        gpa,
-        &parsed_tensors.header,
-    );
-    defer output_header.deinit();
-    p1.stop(io, null);
-
-    const output_infos = output_header.header.tensors.items(.info);
-    const output_bytes: u64 = if (output_infos.len == 0)
-        0
-    else
-        output_infos[output_infos.len - 1].data_offsets[1];
-
-    var p2 = utils.Timer.start("write output header", io);
-    const header_bytes = try safetensors.writeHeader(
-        gpa,
-        &output_header.header,
-        writer,
-    );
-    try writer.flush();
-    p2.stop(io, header_bytes);
-
-    var p3 = utils.Timer.start("dequantize", io);
-    var dequantizer: quantization.Dequantizer = .init(
-        gpa,
-        io,
-        reader,
-        writer,
-        &parsed_tensors,
-    );
-    try dequantizer.dequantize(.nvfp4, .f32);
-    p3.stop(io, output_bytes);
+    _ = writer;
+    _ = reader;
 }
