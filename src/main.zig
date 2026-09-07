@@ -18,7 +18,7 @@ comptime {
 }
 
 pub const input_reader_buffer_size: usize = 64 * 1024;
-pub const output_writer_buffer_size: usize = 64 * 1024;
+pub const output_writer_buffer_size: usize = 256 * 1024;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = heap.smp_allocator;
@@ -48,7 +48,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var input_file_reader_buffer: [input_reader_buffer_size]u8 = undefined;
     var input_file_reader: Io.File.Reader = .init(input_file, io, &input_file_reader_buffer);
-    const reader: *Io.Reader = &input_file_reader.interface;
 
     var output_file_writer_buffer: [output_writer_buffer_size]u8 = undefined;
     var output_file_writer: Io.File.Writer = .init(
@@ -56,8 +55,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
         io,
         &output_file_writer_buffer,
     );
-    const writer: *Io.Writer = &output_file_writer.interface;
 
-    _ = writer;
-    _ = reader;
+    var timer = utils.Timer.start("dequantize", io);
+    var dequantizer = quantization.Dequantizer.init(
+        gpa,
+        io,
+        &input_file_reader.interface,
+        &.{},
+    );
+    defer dequantizer.deinit();
+
+    const dequantizer_reader = dequantizer.reader();
+    const output_bytes = dequantizer_reader.streamRemaining(&output_file_writer.interface) catch |err| {
+        if (dequantizer.maybe_err) |detailed_error| {
+            return log.err("{}", .{detailed_error});
+        }
+
+        return log.err("{}", .{err});
+    };
+
+    try output_file_writer.interface.flush();
+    timer.stop(io, output_bytes);
 }

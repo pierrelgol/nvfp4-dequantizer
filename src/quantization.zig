@@ -120,6 +120,12 @@ pub const Dequantizer = struct {
             return self.fail(err);
         }
 
+        return self.streamInner(w, limit) catch |err| self.fail(err);
+    }
+
+    fn streamInner(self: *Dequantizer, w: *Io.Writer, stream_limit: Io.Limit) !usize {
+        var limit = stream_limit;
+
         if (limit == .nothing) {
             return 0;
         }
@@ -169,7 +175,7 @@ pub const Dequantizer = struct {
             }
 
             if (self.emitting) |block| {
-                const rest = block.output_bytesput_bytes[self.emit_off..block.output_bytesput_len];
+                const rest = block.output_bytes[self.emit_off..block.output_len];
 
                 if (rest.len == 0) {
                     try self.recycleEmittedBlock();
@@ -186,7 +192,7 @@ pub const Dequantizer = struct {
                 written += n;
                 limit = limit.subtract(n) orelse return written;
 
-                if (self.emit_off == block.output_bytesput_len) {
+                if (self.emit_off == block.output_len) {
                     try self.recycleEmittedBlock();
                 }
 
@@ -437,7 +443,7 @@ pub const Dequantizer = struct {
                 .copy => {
                     const n: usize = @intCast(@min(remaining, Block.output_capacity));
 
-                    self.input.readSliceAll(block.output_bytesput_bytes[0..n]) catch |err| {
+                    self.input.readSliceAll(block.output_bytes[0..n]) catch |err| {
                         if (err == error.EndOfStream) {
                             return error.TruncatedPayload;
                         } else {
@@ -446,7 +452,7 @@ pub const Dequantizer = struct {
                     };
 
                     block.sequence = self.sequence;
-                    block.output_bytesput_len = n;
+                    block.output_len = n;
                     block.packed_len = n;
                     block.kind = .copy;
                     self.sequence += 1;
@@ -475,8 +481,8 @@ pub const Dequantizer = struct {
 
                     block.sequence = self.sequence;
                     block.packed_len = n;
-                    block.output_bytesput_len = n * 8;
-                    block.inverse_global_scale = inv;
+                    block.output_len = n * 8;
+                    block.inv_scale = inv;
                     block.kind = .dequant;
                     self.sequence += 1;
                     self.current_idx += n;
@@ -598,18 +604,156 @@ pub const Pool = struct {
     }
 };
 
+fn closedOrCancel(err: anyerror, io: Io) Io.Cancelable!void {
+    return switch (err) {
+        error.Canceled => Io.recancel(io),
+        error.Closed => {},
+        else => unreachable,
+    };
+}
+
 fn decodeWorker(io: Io, pool: *Pool) Io.Cancelable!void {
-    _ = io;
-    _ = pool;
+    while (true) {
+        const block = pool.decodable.getOne(io) catch |err| {
+            return closedOrCancel(err, io);
+        };
+
+        nvfp4.decodeTiles(
+            block.packed_bytes[0..block.packed_len],
+            block.scale_bytes[0 .. block.packed_len / nvfp4.packed_size],
+            block.inv_scale,
+            block.output_bytes[0..block.output_len],
+        );
+
+        pool.decompressed.putOne(io, block) catch |err| {
+            return closedOrCancel(err, io);
+        };
+    }
 }
 
 fn buildStepsList(allocator: mem.Allocator, header: *const safetensors.Header) ![]Step {
-    _ = allocator;
-    _ = header;
+    const steps = try allocator.alloc(Step, header.tensors.len);
+    errdefer allocator.free(steps);
+
+    const names = header.tensors.items(.name);
+    const infos = header.tensors.items(.info);
+
+    for (infos, steps) |info, *step| {
+        const source_length = info.data_offsets[1] - info.data_offsets[0];
+
+        step.* = .{
+            .kind = .copy,
+            .src_start = info.data_offsets[0],
+            .src_len = source_length,
+            .dst_len = source_length,
+        };
+    }
+
+    for (names, 0..) |name, index| {
+        const basename = mem.cutSuffix(u8, name, safetensors.packed_suffix) orelse continue;
+        const local_scale_name = try mem.concat(allocator, u8, &.{ basename, safetensors.local_scale_suffix });
+        defer allocator.free(local_scale_name);
+
+        const global_scale_name = try mem.concat(allocator, u8, &.{ basename, safetensors.global_scale_suffix });
+        defer allocator.free(global_scale_name);
+
+        const local_scale_index = header.tensor_index.get(local_scale_name) orelse return error.MissingLocalScale;
+        const global_scale_index = header.tensor_index.get(global_scale_name) orelse return error.MissingGlobalScale;
+
+        if (local_scale_index >= index or global_scale_index >= index) {
+            return error.MissingCachedScale;
+        }
+
+        if (infos[index].shape.len == 0) {
+            return error.InvalidPackedWeightShape;
+        }
+
+        if (steps[index].src_len % nvfp4.packed_size != 0) {
+            return error.InvalidPackedWeightShape;
+        }
+
+        if (steps[local_scale_index].src_len != steps[index].src_len / nvfp4.packed_size) {
+            return error.InvalidLocalScale;
+        }
+
+        if (steps[global_scale_index].src_len != 4) {
+            return error.InvalidGlobalScale;
+        }
+
+        steps[index].kind = .dequant;
+        steps[index].dst_len = steps[index].src_len * 8;
+        steps[index].scale_index = @intCast(local_scale_index);
+        steps[index].global_index = @intCast(global_scale_index);
+        steps[local_scale_index].kind = .cache_local;
+        steps[global_scale_index].kind = .cache_global;
+    }
+
+    return steps;
 }
 
-fn serializeF32Header(allocator: mem.Allocator, parsed: *const safetensors.ParsedHeader, steps: []const Step) ![]u8 {
-    _ = allocator;
-    _ = parsed;
-    _ = steps;
+fn serializeF32Header(
+    allocator: mem.Allocator,
+    parsed: *const safetensors.ParsedHeader,
+    steps: []const Step,
+) ![]u8 {
+    var arena = heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var allocating: Io.Writer.Allocating = .init(arena_allocator);
+    var stringify: json.Stringify = .{
+        .writer = &allocating.writer,
+        .options = .{},
+    };
+
+    try stringify.beginObject();
+
+    const tensors = parsed.header.tensors.slice();
+    var output_offset: u64 = 0;
+
+    for (steps, 0..) |step, index| {
+        const tensor = tensors.get(index);
+
+        switch (step.kind) {
+            .cache_local, .cache_global => {},
+            .copy => {
+                const output_end = try math.add(u64, output_offset, step.src_len);
+
+                try stringify.objectField(tensor.name);
+                try stringify.write(Tensor.Info{
+                    .dtype = tensor.info.dtype,
+                    .shape = tensor.info.shape,
+                    .data_offsets = .{ output_offset, output_end },
+                });
+
+                output_offset = output_end;
+            },
+            .dequant => {
+                const basename = mem.cutSuffix(u8, tensor.name, safetensors.packed_suffix) orelse return error.InvalidPackedWeightName;
+
+                if (tensor.info.shape.len == 0) {
+                    return error.InvalidPackedWeightShape;
+                }
+
+                const output_shape = try arena_allocator.dupe(u64, tensor.info.shape);
+                output_shape[output_shape.len - 1] = try math.mul(u64, output_shape[output_shape.len - 1], 2);
+
+                const output_end = try math.add(u64, output_offset, step.dst_len);
+                const output_name = try mem.concat(arena_allocator, u8, &.{ basename, safetensors.weight_suffix });
+
+                try stringify.objectField(output_name);
+                try stringify.write(Tensor.Info{
+                    .dtype = .F32,
+                    .shape = output_shape,
+                    .data_offsets = .{ output_offset, output_end },
+                });
+
+                output_offset = output_end;
+            },
+        }
+    }
+
+    try stringify.endObject();
+
+    return safetensors.serializeHeader(allocator, allocating.writer.buffered());
 }
