@@ -18,7 +18,7 @@ comptime {
 }
 
 pub const input_reader_buffer_size: usize = 64 * 1024;
-pub const output_writer_buffer_size: usize = 256 * 1024;
+pub const output_writer_buffer_size: usize = 1024 * 1024;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = heap.smp_allocator;
