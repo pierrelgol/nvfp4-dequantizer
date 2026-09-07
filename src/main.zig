@@ -7,6 +7,7 @@ const process = std.process;
 
 const cli = @import("cli.zig");
 const utils = @import("utils.zig");
+const safetensors = @import("safetensors.zig");
 
 pub const input_reader_buffer_size: usize = 64 * 1024;
 pub const output_writer_buffer_size: usize = 64 * 1024;
