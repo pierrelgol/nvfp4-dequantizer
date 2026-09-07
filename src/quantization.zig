@@ -40,13 +40,146 @@ pub const Dequantizer = struct {
             .sequence = 0,
         };
     }
-    pub fn deinit() void {}
 
-    pub fn stream(reader: *Io.Reader, writer: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-        _ = reader;
-        _ = writer;
-        _ = limit;
+    pub fn deinit(self: *Dequantizer) void {
+        defer self.* = undefined;
+        self.stop();
+
+        if (self.pool) |pool| {
+            defer self.pool = undefined;
+            self.allocator.free(pool.blocks);
+            self.allocator.destroy(pool);
+        }
+
+        for (self.cache) |entry| {
+            if (entry.local_scales) |scales| {
+                self.allocator.free(scales);
+            }
+        }
+
+        self.allocator.free(self.cache);
+        self.allocator.free(self.steps);
+
+        if (self.parsed) |*parsed| {
+            parsed.deinit();
+        }
     }
+
+    pub fn reader(self: *Dequantizer) *Io.Reader {
+        return &self.interface;
+    }
+
+    pub fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *Dequantizer = @fieldParentPtr("interface", r);
+
+        if (self.maybe_err) |err| {
+            return self.fail(err);
+        }
+
+        if (limit == .nothing) {
+            return 0;
+        }
+
+        if (self.parsed == null) {
+            try self.parse();
+        }
+
+        _ = w;
+    }
+
+    pub fn stop(self: *Dequantizer) void {
+        if (self.pool) |pool| {
+            pool.close(self.io);
+        }
+
+        if (self.workers_started) {
+            self.workers.cancel(self.io);
+            self.workers_started = false;
+        }
+    }
+
+    pub fn fail(self: *Dequantizer, err: anyerror) Io.Reader.StreamError {
+        if (self.maybe_err == null) {
+            self.maybe_err = err;
+        }
+
+        if (self.pool) |pool| {
+            pool.fail(self.io, err);
+        }
+
+        switch (err) {
+            error.WriteFailed, error.EndOfStream => |e| return e,
+            else => return error.ReadFailed,
+        }
+    }
+
+    fn parse(self: *Dequantizer) !void {
+        self.parsed = self.readAndParseHeader() catch |err| {
+            return switch (err) {
+                error.EndOfStream, error.UnexpectedEndOfInput => error.TruncatedHeader,
+                else => err,
+            };
+        };
+
+        const parsed = &self.parsed.?;
+        self.steps = try buildStepsList(self.allocator, &parsed.header);
+        errdefer {
+            self.allocator.free(self.steps);
+            self.steps = &.{};
+        }
+
+        self.cache = try self.allocator.alloc(WeightCache, parsed.header.tensors.len);
+        errdefer {
+            self.allocator.free(self.cache);
+            self.cache = &.{};
+        }
+        @memset(self.cache, .{});
+
+        self.header_out = try serializeF32Header(self.allocator, parsed, self.steps);
+        errdefer {
+            self.allocator.free(self.header_out);
+            self.header_out = &.{};
+        }
+
+        const pool = try self.allocator.create(Pool);
+        errdefer self.allocator.destroy(pool);
+
+        pool.* = .{};
+        pool.available = .init(&pool.available_buf);
+        pool.decode = .init(&pool.decode_buf);
+        pool.done = .init(&pool.done_buf);
+        pool.tiles = try self.allocator.alloc(Block, Pool.total_block_count);
+
+        errdefer self.allocator.free(pool.tiles);
+
+        self.pool = pool;
+        errdefer {
+            self.stop();
+            self.pool = null;
+        }
+
+        for (pool.tiles) |*tile| {
+            try pool.available.putOne(self.io, tile);
+        }
+
+        for (0..Pool.total_worker) |_| {
+            try self.workers.concurrent(self.io, decodeWorker, .{ self.io, pool });
+            self.workers_started = true;
+        }
+    }
+
+    fn buildStepsList(allocator: mem.Allocator, header: *safetensors.Header) !void {
+        _ = allocator;
+        _ = header;
+    }
+
+    fn serializeF32Header(allocator: mem.Allocator, parsed: safetensors.ParsedHeader, steps: []Step) void {
+        _ = allocator;
+        _ = parsed;
+        _ = steps;
+    }
+
+    fn decodeWorker() void {}
 };
 
 pub const WeightCache = struct {
