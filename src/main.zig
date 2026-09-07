@@ -27,22 +27,30 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const io = io_instance.io();
 
     var args = init.args.iterateAllocator(gpa) catch |err| {
-        return log.err("{}", .{err});
+        log.err("{}", .{err});
+        return err;
     };
     defer args.deinit();
     _ = args.skip();
 
     const parsed_args: cli.Result = cli.parseArgs(&args) catch |err| {
-        return log.err("{}", .{err});
+        log.err("{}", .{err});
+        return err;
     };
 
+    if (mem.eql(u8, parsed_args.input_path, parsed_args.output_path)) {
+        return error.InputAndOutputPathsMatch;
+    }
+
     const input_file: Io.File = Io.Dir.openFile(.cwd(), io, parsed_args.input_path, .{ .mode = .read_only }) catch |err| {
-        return log.err("{}", .{err});
+        log.err("{}", .{err});
+        return err;
     };
     defer input_file.close(io);
 
     const output_file: Io.File = Io.Dir.createFile(.cwd(), io, parsed_args.output_path, .{}) catch |err| {
-        return log.err("{}", .{err});
+        log.err("{}", .{err});
+        return err;
     };
     defer output_file.close(io);
 
@@ -68,10 +76,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const dequantizer_reader = dequantizer.reader();
     const output_bytes = dequantizer_reader.streamRemaining(&output_file_writer.interface) catch |err| {
         if (dequantizer.maybe_err) |detailed_error| {
-            return log.err("{}", .{detailed_error});
+            log.err("{}", .{detailed_error});
+            return detailed_error;
         }
 
-        return log.err("{}", .{err});
+        log.err("{}", .{err});
+        return err;
     };
 
     try output_file_writer.interface.flush();

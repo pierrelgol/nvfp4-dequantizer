@@ -618,7 +618,7 @@ fn decodeWorker(io: Io, pool: *Pool) Io.Cancelable!void {
             return closedOrCancel(err, io);
         };
 
-        nvfp4.decodeTiles(
+        nvfp4.decodeBlocks(
             block.packed_bytes[0..block.packed_len],
             block.scale_bytes[0 .. block.packed_len / nvfp4.packed_size],
             block.inv_scale,
