@@ -4,7 +4,7 @@ Streaming NVFP4 to F32 converter for Safetensors files, written in Zig.
 
 ## Architecture
 
-The input header is parsed and its tensors are classified. A new Safetensors header is built for the F32 output. Tensor data then moves through a bounded pipeline with four dequantization workers and an ordered writer; tensors that do not need conversion are copied unchanged.
+The input header is parsed and its tensors are classified. A new Safetensors header is built for the F32 output. A std.Io.Reader is used to pipe the parsing/dequantization to a writer 
 
 ## Benchmark
 
