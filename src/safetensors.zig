@@ -3,7 +3,6 @@ const Io = std.Io;
 const Tensor = @import("Tensor.zig");
 const json = std.json;
 const mem = std.mem;
-const heap = std.heap;
 const safetensors = @This();
 
 pub const Error = error{
@@ -22,8 +21,6 @@ pub const weight_suffix = ".weight";
 pub const Header = struct {
     tensors: std.MultiArrayList(Tensor) = .empty,
     tensor_index: std.StringArrayHashMapUnmanaged(Tensor.Index) = .empty,
-    tensor_units: std.StringArrayHashMapUnmanaged(Tensor.Unit) = .empty,
-    tensor_operations: std.ArrayListUnmanaged(Tensor.Operation) = .empty,
     metadata: ?Tensor.Metadata = null,
 
     pub const maximum_header_size = 100 * 1024 * 1024;
@@ -42,8 +39,7 @@ pub const Header = struct {
             slice: std.MultiArrayList(Tensor).Slice,
 
             pub fn lessThan(ctx: @This(), lhs: usize, rhs: usize) bool {
-                return ctx.slice.items(.info)[lhs].data_offsets[0] <
-                    ctx.slice.items(.info)[rhs].data_offsets[0];
+                return ctx.slice.items(.info)[lhs].data_offsets[0] < ctx.slice.items(.info)[rhs].data_offsets[0];
             }
         };
 
@@ -64,63 +60,10 @@ pub const Header = struct {
             }
         }
     }
-
-    fn indexTensorsByUnit(header: *safetensors.Header, allocator: mem.Allocator) !void {
-        var scratch_buffer: [4096]u8 = undefined;
-        var fba: heap.FixedBufferAllocator = .init(&scratch_buffer);
-
-        for (header.tensors.items(.name), 0..) |name, index| {
-            defer fba.reset();
-            const basename = mem.cutSuffix(u8, name, packed_suffix) orelse continue;
-
-            const local_scale_key = try mem.concat(
-                fba.allocator(),
-                u8,
-                &.{ basename, local_scale_suffix },
-            );
-
-            const global_scale_key = try mem.concat(
-                fba.allocator(),
-                u8,
-                &.{ basename, global_scale_suffix },
-            );
-
-            const local_scale_index = header.tensor_index.get(local_scale_key) orelse return error.MissingLocalScale;
-            const global_scale_index = header.tensor_index.get(global_scale_key) orelse return error.MissingGrlobalScale;
-
-            const gop = try header.tensor_units.getOrPut(allocator, basename);
-
-            if (gop.found_existing) {
-                return error.DuplicateTensorName;
-            } else {
-                gop.value_ptr.* = .{
-                    .index_of_weights = index,
-                    .index_of_local_scale = local_scale_index,
-                    .index_of_global_scale = global_scale_index,
-                };
-            }
-        }
-    }
-
-    fn indexTensorsByOperation(header: *safetensors.Header, allocator: mem.Allocator) !void {
-        const operations = try allocator.alloc(Tensor.Operation, header.tensors.len);
-        @memset(operations, .copy);
-
-        var it = header.tensor_units.iterator();
-        while (it.next()) |entry| {
-            const unit = entry.value_ptr.*;
-            operations[unit.index_of_weights] = .dequantize;
-            operations[unit.index_of_local_scale] = .cache_local;
-            operations[unit.index_of_global_scale] = .cache_global;
-        }
-
-        header.tensor_operations = .initBuffer(operations);
-        header.tensor_operations.items = operations;
-    }
 };
 
 pub const ParsedHeader = struct {
-    arena: heap.ArenaAllocator,
+    arena: std.heap.ArenaAllocator,
     header: safetensors.Header,
     header_size: u64 = 0,
     tensors_start_offset: u64 = 0,
@@ -142,7 +85,14 @@ pub const ParsedHeader = struct {
 
 pub fn parse(allocator: mem.Allocator, reader: *Io.Reader) !safetensors.ParsedHeader {
     const header_size = try reader.takeInt(u64, .little);
+    return parseJson(allocator, reader, header_size);
+}
 
+pub fn parseJson(
+    allocator: mem.Allocator,
+    reader: *Io.Reader,
+    header_size: u64,
+) !safetensors.ParsedHeader {
     if (header_size > Header.maximum_header_size) {
         return error.InvalidHeaderSize;
     }
@@ -179,8 +129,7 @@ pub fn parse(allocator: mem.Allocator, reader: *Io.Reader) !safetensors.ParsedHe
         };
 
         if (mem.eql(u8, "__metadata__", object_name)) {
-            const parsed = try json.innerParse(?Tensor.Metadata, arena, &json_reader, options);
-            result.header.metadata = parsed;
+            result.header.metadata = try json.innerParse(?Tensor.Metadata, arena, &json_reader, options);
             continue;
         }
 
@@ -203,123 +152,29 @@ pub fn parse(allocator: mem.Allocator, reader: *Io.Reader) !safetensors.ParsedHe
 
     result.header.sortTensorsByDataOffsets();
     try result.header.indexTensorsByName(arena);
-    try result.header.indexTensorsByUnit(arena);
-    try result.header.indexTensorsByOperation(arena);
 
-    return result;
-}
-
-pub fn buildDequantizedHeader(
-    allocator: mem.Allocator,
-    input: *const Header,
-) !ParsedHeader {
-    var result: ParsedHeader = .init(allocator, 0);
-    errdefer result.deinit();
-    const arena = result.arena.allocator();
-    const tensors = input.tensors.slice();
-
-    var output_offset: u64 = 0;
-    for (input.tensor_operations.items, 0..) |operation, index| {
-        const tensor = tensors.get(index);
-        const input_size = tensor.info.data_offsets[1] -
-            tensor.info.data_offsets[0];
-
-        switch (operation) {
-            .cache_local, .cache_global => {},
-            .copy => {
-                const output_end = try std.math.add(
-                    u64,
-                    output_offset,
-                    input_size,
-                );
-                try result.header.tensors.append(arena, .{
-                    .sequence = result.header.tensors.len,
-                    .name = try arena.dupe(u8, tensor.name),
-                    .info = .{
-                        .dtype = tensor.info.dtype,
-                        .shape = try arena.dupe(u64, tensor.info.shape),
-                        .data_offsets = .{ output_offset, output_end },
-                    },
-                });
-                output_offset = output_end;
-            },
-            .dequantize => {
-                const basename = mem.cutSuffix(
-                    u8,
-                    tensor.name,
-                    packed_suffix,
-                ) orelse return error.InvalidPackedWeightName;
-                if (tensor.info.shape.len == 0) {
-                    return error.InvalidPackedWeightShape;
-                }
-
-                const output_shape = try arena.dupe(u64, tensor.info.shape);
-                output_shape[output_shape.len - 1] = try std.math.mul(
-                    u64,
-                    output_shape[output_shape.len - 1],
-                    2,
-                );
-                const output_size = try std.math.mul(u64, input_size, 8);
-                const output_end = try std.math.add(
-                    u64,
-                    output_offset,
-                    output_size,
-                );
-                try result.header.tensors.append(arena, .{
-                    .sequence = result.header.tensors.len,
-                    .name = try mem.concat(
-                        arena,
-                        u8,
-                        &.{ basename, weight_suffix },
-                    ),
-                    .info = .{
-                        .dtype = .F32,
-                        .shape = output_shape,
-                        .data_offsets = .{ output_offset, output_end },
-                    },
-                });
-                output_offset = output_end;
-            },
-            .quantize => return error.UnsupportedConversion,
-        }
+    var end: u64 = 0;
+    for (result.header.tensors.items(.info)) |info| {
+        if (info.data_offsets[0] < end) return error.InvalidTensorOffsets;
+        end = info.data_offsets[1];
     }
 
     return result;
 }
 
-pub fn writeHeader(allocator: mem.Allocator, header: *const Header, writer: *Io.Writer) !u64 {
-    var allocating: Io.Writer.Allocating = .init(allocator);
-    defer allocating.deinit();
-
-    var stringify: json.Stringify = .{
-        .writer = &allocating.writer,
-        .options = .{},
-    };
-
-    try stringify.beginObject();
-    const tensors = header.tensors.slice();
-
-    for (0..tensors.len) |index| {
-        const tensor = tensors.get(index);
-        try stringify.objectField(tensor.name);
-        try stringify.write(tensor.info);
-    }
-
-    try stringify.endObject();
-
-    const json_bytes = allocating.writer.buffered();
-    const padding = (8 - (json_bytes.len % 8)) % 8;
-    const header_size = json_bytes.len + padding;
+pub fn serializeHeader(allocator: mem.Allocator, stringify_body: []const u8) ![]u8 {
+    const padding = (8 - (stringify_body.len % 8)) % 8;
+    const header_size = stringify_body.len + padding;
 
     if (header_size > Header.maximum_header_size) {
         return error.InvalidHeaderSize;
     }
 
-    try writer.writeInt(u64, @intCast(header_size), .little);
-    try writer.writeAll(json_bytes);
-    try writer.splatByteAll(' ', padding);
-
-    return @sizeOf(u64) + header_size;
+    const bytes = try allocator.alloc(u8, @sizeOf(u64) + header_size);
+    mem.writeInt(u64, bytes[0..8], @intCast(header_size), .little);
+    @memcpy(bytes[8 .. 8 + stringify_body.len], stringify_body);
+    @memset(bytes[8 + stringify_body.len ..], ' ');
+    return bytes;
 }
 
 // Adapted from huggingface/safetensors safetensors/src/tensor.rs.

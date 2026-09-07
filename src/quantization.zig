@@ -1,446 +1,591 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const mem = std.mem;
 const Io = std.Io;
 const math = std.math;
+const json = std.json;
+const heap = std.heap;
 const safetensors = @import("safetensors.zig");
+const nvfp4 = @import("nvfp4.zig");
+const Tensor = @import("Tensor.zig");
 
 pub const Dequantizer = struct {
     allocator: mem.Allocator,
-    io: Io,
+    io: std.Io,
     input: *Io.Reader,
-    output: *Io.Writer,
-    ctx: *const safetensors.ParsedHeader,
+    interface: Io.Reader,
+    maybe_err: ?anyerror = null,
+    sequence: usize = 0,
+
+    parsed: ?safetensors.ParsedHeader = null,
+    steps: []Step = &.{},
+    cache: []WeightCache = &.{},
+    output_header: []u8 = &.{},
+    output_header_idx: usize = 0,
+
+    pool: ?*Pool = null,
+    workers: Io.Group = .init,
+    workers_started: bool = false,
+
+    step_offset: usize = 0,
+    step_index: usize = 0,
+    current_idx: u64 = 0,
+    next_write: usize = 0,
+    in_flight: usize = 0,
+    pending: [Pool.total_block_count]?*Block = @splat(null),
+    emitting: ?*Block = null,
+    emit_off: usize = 0,
+    fill_eof: bool = false,
+    payload_done: bool = false,
+    decode_closed: bool = false,
+
+    const vtable: Io.Reader.VTable = .{ .stream = stream };
 
     pub fn init(
         allocator: mem.Allocator,
         io: Io,
         input: *Io.Reader,
-        output: *Io.Writer,
-        ctx: *const safetensors.ParsedHeader,
+        buffer: []u8,
     ) Dequantizer {
         return .{
+            .interface = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .input = input,
             .allocator = allocator,
             .io = io,
-            .input = input,
-            .output = output,
-            .ctx = ctx,
         };
     }
 
-    pub fn dequantize(self: *Dequantizer, from: Scheme, to: Scheme) !void {
-        if (from != .nvfp4 or to != .f32) {
-            return error.UnsupportedConversion;
+    pub fn deinit(self: *Dequantizer) void {
+        defer self.* = undefined;
+
+        self.stop();
+        if (self.pool) |pool| {
+            self.allocator.free(pool.blocks);
+            self.allocator.destroy(pool);
         }
 
-        const tensors = self.ctx.header.tensors.slice();
-        const operations = self.ctx.header.tensor_operations.items;
-        std.debug.assert(operations.len == tensors.len);
-
-        var pool: Pool = .{};
-        pool.available = .init(&pool.available_buf);
-        pool.decode = .init(&pool.decode_buf);
-        pool.done = .init(&pool.done_buf);
-        pool.chunks = try self.allocator.alloc(Chunk, Pool.count);
-
-        errdefer {
-            pool.close(self.io);
-            self.allocator.free(pool.chunks);
-        }
-
-        for (pool.chunks) |*chunk| {
-            try pool.available.putOne(self.io, chunk);
-        }
-
-        defer {
-            pool.close(self.io);
-            self.allocator.free(pool.chunks);
-        }
-
-        var writer_future = try self.io.concurrent(
-            writeWorker,
-            .{ self.io, self.output, &pool },
-        );
-
-        var workers: Io.Group = .init;
-        var writer_done = false;
-        var workers_done = false;
-
-        defer {
-            if (!workers_done or !writer_done) {
-                pool.close(self.io);
-                if (!workers_done) {
-                    workers.cancel(self.io);
-                }
-                if (!writer_done) {
-                    _ = writer_future.cancel(self.io) catch {};
-                }
+        for (self.cache) |entry| {
+            if (entry.local_scales) |scales| {
+                self.allocator.free(scales);
             }
         }
 
-        for (0..worker_count) |_| {
-            try workers.concurrent(self.io, decodeWorker, .{ self.io, &pool });
-        }
+        self.allocator.free(self.cache);
+        self.allocator.free(self.steps);
+        self.allocator.free(self.output_header);
 
-        const cache = try self.allocator.alloc(WeightCache, tensors.len);
-        defer {
-            for (cache) |entry| {
-                if (entry.local_scales) |scales| {
-                    self.allocator.free(scales);
-                }
-            }
-            self.allocator.free(cache);
-        }
-        @memset(cache, .{});
-
-        var cursor: u64 = 0;
-        var sequence: usize = 0;
-
-        for (
-            operations,
-            tensors.items(.name),
-            tensors.items(.info),
-            0..,
-        ) |operation, name, info, tensor_index| {
-            const start = info.data_offsets[0];
-            const size = info.data_offsets[1] - start;
-
-            if (start > cursor) {
-                try self.input.discardAll64(start - cursor);
-            }
-
-            switch (operation) {
-                .copy => {
-                    var remaining = size;
-                    while (remaining > 0) {
-                        const len: usize = @intCast(@min(
-                            remaining,
-                            Chunk.output_capacity,
-                        ));
-                        const chunk = try pool.takeAvailable(self.io);
-                        chunk.sequence = sequence;
-                        chunk.output_len = len;
-
-                        try self.input.readSliceAll(
-                            chunk.decoded_weights[0..len],
-                        );
-                        pool.done.putOne(self.io, chunk) catch |err| {
-                            return pool.queueError(self.io, err);
-                        };
-
-                        sequence += 1;
-                        remaining -= len;
-                    }
-                },
-                .cache_local => {
-                    const scales = try self.allocator.alloc(
-                        u8,
-                        @intCast(size),
-                    );
-                    errdefer self.allocator.free(scales);
-                    try self.input.readSliceAll(scales);
-                    cache[tensor_index].local_scales = scales;
-                },
-                .cache_global => {
-                    if (size != @sizeOf(f32)) {
-                        return error.InvalidGlobalScale;
-                    }
-
-                    const scale: f32 = @bitCast(
-                        try self.input.takeInt(u32, .little),
-                    );
-                    if (!math.isFinite(scale) or scale <= 0) {
-                        return error.InvalidGlobalScale;
-                    }
-                    cache[tensor_index].inverse_global_scale = 1.0 / scale;
-                },
-                .dequantize => {
-                    const basename = mem.cutSuffix(
-                        u8,
-                        name,
-                        safetensors.packed_suffix,
-                    ) orelse return error.InvalidPackedWeightName;
-                    const unit = self.ctx.header.tensor_units.get(basename) orelse
-                        return error.MissingTensorUnit;
-                    const local_index = unit.index_of_local_scale;
-                    const scales = cache[local_index].local_scales orelse
-                        return error.MissingCachedScale;
-                    const inverse_scale = cache[unit.index_of_global_scale]
-                        .inverse_global_scale orelse
-                        return error.MissingCachedScale;
-
-                    var remaining = size;
-                    var scale_offset: usize = 0;
-
-                    while (remaining > 0) {
-                        const len: usize = @intCast(@min(remaining, Chunk.input_capacity));
-                        std.debug.assert(len % @sizeOf(Nvfp4.PackedWeights) == 0);
-
-                        const scale_count = len / @sizeOf(Nvfp4.PackedWeights);
-                        const chunk = try pool.takeAvailable(self.io);
-
-                        chunk.sequence = sequence;
-                        chunk.input_len = len;
-                        chunk.output_len = len * 8;
-                        chunk.inverse_global_scale = inverse_scale;
-
-                        try self.input.readSliceAll(chunk.packed_weights[0..len]);
-                        @memcpy(chunk.local_scales[0..scale_count], scales[scale_offset..][0..scale_count]);
-
-                        pool.decode.putOne(self.io, chunk) catch |err| {
-                            return pool.queueError(self.io, err);
-                        };
-
-                        sequence += 1;
-                        scale_offset += scale_count;
-                        remaining -= len;
-                    }
-
-                    std.debug.assert(scale_offset == scales.len);
-                    self.allocator.free(scales);
-                    cache[local_index].local_scales = null;
-                },
-                .quantize => {
-                    return error.UnsupportedConversion;
-                },
-            }
-
-            cursor = info.data_offsets[1];
-        }
-
-        pool.decode.close(self.io);
-
-        workers.await(self.io) catch |err| {
-            return pool.getError(self.io) orelse err;
-        };
-        workers_done = true;
-
-        pool.done.close(self.io);
-        writer_future.await(self.io) catch |err| {
-            return pool.getError(self.io) orelse err;
-        };
-        writer_done = true;
-
-        if (pool.getError(self.io)) |err| {
-            return err;
+        if (self.parsed) |*parsed| {
+            parsed.deinit();
         }
     }
-};
-/// source that helped : https://github.com/pytorch/pytorch/blob/main/torch/headeronly/util/Float8_e4m3fn.h
-/// also this is peak: https://github.com/ggml-org/ggml/blob/master/src/ggml-quants.c#L589
-/// and of course this : https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/
-/// https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-cpu/ggml-cpu.c#L86
-/// https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-cpu/ggml-cpu.c#L3857-L3860
-/// llama.cpp/ggml/src/ggml-common.h
-/// llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c
-/// llama.cpp/ggml/src/ggml-cpu/simd-mappings.h
-pub const Nvfp4 = struct {
-    pub const packed_count: usize = 16;
-    pub const PackedWeights = [packed_count / 2]u8;
-    pub const DecodedWeights = [packed_count]f32;
 
-    const ByteVec = @Vector(packed_count, i8);
-    const BitsVec = @Vector(packed_count, u32);
+    pub fn reader(self: *Dequantizer) *Io.Reader {
+        return &self.interface;
+    }
 
-    extern fn @"llvm.x86.ssse3.pshuf.b.128"(table: ByteVec, indices: ByteVec) ByteVec;
-    extern fn @"llvm.aarch64.neon.tbl1.v16i8"(table: ByteVec, indices: ByteVec) ByteVec;
+    pub fn stop(self: *Dequantizer) void {
+        if (self.pool) |pool| {
+            pool.close(self.io);
+        }
 
-    pub const e2m1_lut: [16]i8 = .{
-        0, 1,  2,  3,  4,  6,  8,  12,
-        0, -1, -2, -3, -4, -6, -8, -12,
-    };
+        if (self.workers_started) {
+            self.workers.cancel(self.io);
+            self.workers_started = false;
+        }
+    }
 
-    // E2M1 and UE4M3 lookup tables derived from llama.cpp/ggml:
-    // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-common.h#L1123-L1129
-    // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-impl.h#L500-L515
-    // https://github.com/ggml-org/llama.cpp/blob/f1793c1c4e586022efa0b1d3aa6e30ccd67f4e2d/ggml/src/ggml-cpu/ggml-cpu.c#L3857-L3860
-    //      from https://github.com/ggml-org/llama.cpp/blob/0190529ec450659b541ff608449401e68c27d098/ggml/src/ggml-impl.h#L502
-    //
-    // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
-    // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
-    //static inline float ggml_ue4m3_to_fp32(uint8_t x) {
-    //    if (x == 0 || x == 0x7F) {
-    //        return 0.0f;
-    //    }
-    //    int   exp = (x >> 3) & 0xF;
-    //    int   man = x & 0x7;
-    //    float raw;
-    //    if (exp == 0) {
-    //        raw = ldexpf((float) man, -9);
-    //    } else {
-    //        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
-    //    }
-    //    return raw * 0.5f;
-    //}
-    // UE4M3 * 0.5 so the LUT matches kvalues_mxfp4 (2 * E2M1).
-    pub const e4m3_lut: [256]f32 = lut: {
-        @setEvalBranchQuota(100000);
-        var values: [256]f32 = undefined;
+    pub fn fail(self: *Dequantizer, err: anyerror) Io.Reader.StreamError {
+        if (self.maybe_err == null) {
+            self.maybe_err = err;
+        }
 
-        for (&values, 0..) |*slot, index| {
-            const code: u8 = @intCast(index);
+        if (self.pool) |pool| {
+            pool.fail(self.io, err);
+        }
 
-            if (code == 0 or code == 0x7f) {
-                slot.* = 0;
+        switch (err) {
+            error.WriteFailed, error.EndOfStream => |e| return e,
+            else => return error.ReadFailed,
+        }
+    }
+
+    pub fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *Dequantizer = @fieldParentPtr("interface", r);
+
+        if (self.maybe_err) |err| {
+            return self.fail(err);
+        }
+
+        return self.streamInner(w, limit) catch |err| self.fail(err);
+    }
+
+    fn streamInner(self: *Dequantizer, w: *Io.Writer, stream_limit: Io.Limit) !usize {
+        var limit = stream_limit;
+
+        if (limit == .nothing) {
+            return 0;
+        }
+
+        if (self.parsed == null) {
+            try self.initializeStream();
+        }
+
+        var written: usize = 0;
+
+        if (self.output_header_idx < self.output_header.len) {
+            const n = try w.write(limit.sliceConst(self.output_header[self.output_header_idx..]));
+
+            if (n == 0) {
+                return error.WriteFailed;
+            }
+
+            self.output_header_idx += n;
+            written += n;
+            limit = limit.subtract(n) orelse return written;
+
+            if (limit == .nothing or self.output_header_idx < self.output_header.len) {
+                return written;
+            }
+        }
+
+        if (self.payload_done) {
+            if (written == 0) {
+                return error.EndOfStream;
+            } else {
+                return written;
+            }
+        }
+
+        while (limit != .nothing) {
+            try self.queueAvailableBlocks();
+            try self.collectCompletedBlock(false);
+
+            if (self.emitting == null) {
+                if (self.pending[self.next_write % Pool.total_block_count]) |block| {
+                    if (block.sequence == self.next_write) {
+                        self.emitting = block;
+                        self.emit_off = 0;
+                        self.pending[self.next_write % Pool.total_block_count] = null;
+                    }
+                }
+            }
+
+            if (self.emitting) |block| {
+                const rest = block.output_bytes[self.emit_off..block.output_len];
+
+                if (rest.len == 0) {
+                    try self.recycleEmittedBlock();
+                    continue;
+                }
+
+                const n = try w.write(limit.sliceConst(rest));
+
+                if (n == 0) {
+                    return error.WriteFailed;
+                }
+
+                self.emit_off += n;
+                written += n;
+                limit = limit.subtract(n) orelse return written;
+
+                if (self.emit_off == block.output_len) {
+                    try self.recycleEmittedBlock();
+                }
+
+                if (limit == .nothing) {
+                    return written;
+                }
+
                 continue;
             }
 
-            const exponent: u8 = (code >> 3) & 0x0f;
-            const mantissa: u8 = code & 0x07;
-            var value: f32 = undefined;
-
-            if (exponent == 0) {
-                value = @as(f32, @floatFromInt(mantissa)) / 1024.0;
-            } else {
-                value = 1.0 + @as(f32, @floatFromInt(mantissa)) / 8.0;
+            if (self.fill_eof and self.in_flight == 0) {
+                self.closeDecode();
+                self.payload_done = true;
+                break;
             }
 
-            if (exponent != 0) {
-                const power: i8 = @as(i8, @intCast(exponent)) - 8;
-
-                if (power >= 0) {
-                    for (0..@intCast(power)) |_| {
-                        value *= 2.0;
-                    }
-                } else {
-                    for (0..@intCast(-power)) |_| {
-                        value *= 0.5;
-                    }
-                }
-            }
-
-            slot.* = value;
+            try self.collectCompletedBlock(true);
         }
 
-        break :lut values;
-    };
+        if (written == 0) {
+            if (self.payload_done) {
+                return error.EndOfStream;
+            } else {
+                return error.ReadFailed;
+            }
+        }
+        return written;
+    }
 
-    pub fn decodePackedWeights(packed_weights: PackedWeights, scale: u8, inverse_global_scale: f32) DecodedWeights {
-        const PackedVector = @Vector(8, u8);
-        const CodeVector = @Vector(16, u8);
-        const SignedVector = @Vector(16, i8);
-        const FloatVector = @Vector(16, f32);
-        const ShuffleMask = @Vector(16, i32);
-        const nibble_mask: PackedVector = @splat(0x0f);
-        const nibble_shift: PackedVector = @splat(4);
+    fn recycleEmittedBlock(self: *Dequantizer) !void {
+        const block = self.emitting.?;
+        self.emitting = null;
+        self.next_write += 1;
+        self.in_flight -= 1;
+        const pool = self.pool.?;
 
-        const interleave_mask: ShuffleMask = .{
-            0, -1, 1, -2, 2, -3, 3, -4,
-            4, -5, 5, -6, 6, -7, 7, -8,
+        pool.available.putOne(self.io, block) catch |err| {
+            return pool.queueError(self.io, err);
+        };
+    }
+
+    fn collectCompletedBlock(self: *Dequantizer, wait: bool) !void {
+        const pool = self.pool.?;
+        var slot: [1]*Block = undefined;
+
+        const n = if (wait) blk: {
+            slot[0] = pool.decompressed.getOne(self.io) catch |err| {
+                return switch (err) {
+                    error.Closed => pool.getError(self.io) orelse error.Closed,
+                    error.Canceled => error.Canceled,
+                };
+            };
+
+            break :blk 1;
+        } else pool.decompressed.get(self.io, &slot, 0) catch |err| {
+            return switch (err) {
+                error.Closed => pool.getError(self.io) orelse error.Closed,
+                error.Canceled => error.Canceled,
+            };
         };
 
-        const quantized_weights: PackedVector = @bitCast(packed_weights);
-        const low = quantized_weights & nibble_mask;
-        const high = quantized_weights >> nibble_shift;
-        const code: CodeVector = @shuffle(u8, low, high, interleave_mask);
-        const code_values: [packed_count]u8 = @bitCast(code);
-        const table: ByteVec = @bitCast(e2m1_lut);
-        const indices: ByteVec = @bitCast(code);
+        if (n == 0) {
+            return;
+        }
 
-        const e2m1: SignedVector = switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                if (std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3)) {
-                    break :blk @"llvm.x86.ssse3.pshuf.b.128"(
-                        table,
-                        indices,
-                    );
-                }
+        const block = slot[0];
+        const index = block.sequence % Pool.total_block_count;
 
-                var values: [packed_count]i8 = undefined;
+        std.debug.assert(self.pending[index] == null);
+        self.pending[index] = block;
+    }
 
-                for (code_values, 0..) |value, index| {
-                    values[index] = e2m1_lut[value];
-                }
+    fn closeDecode(self: *Dequantizer) void {
+        if (self.decode_closed) {
+            return;
+        }
 
-                break :blk @bitCast(values);
-            },
-            .aarch64 => @"llvm.aarch64.neon.tbl1.v16i8"(table, indices),
-            else => blk: {
-                var values: [packed_count]i8 = undefined;
+        if (self.pool) |pool| {
+            pool.decodable.close(self.io);
+        }
 
-                for (code_values, 0..) |value, index| {
-                    values[index] = e2m1_lut[value];
-                }
+        self.decode_closed = true;
+    }
 
-                break :blk @bitCast(values);
-            },
+    fn initializeStream(self: *Dequantizer) !void {
+        self.parsed = self.readAndParseHeader() catch |err| {
+            return switch (err) {
+                error.EndOfStream, error.UnexpectedEndOfInput => error.TruncatedHeader,
+                else => err,
+            };
         };
 
-        const converted_values: FloatVector = @floatFromInt(e2m1);
-        const unsigned_values: BitsVec = @bitCast(converted_values);
-        const negative_zero_code: CodeVector = @splat(0b1000);
-        const negative_zero_bits: BitsVec = @splat(0x8000_0000);
-        const values: FloatVector = @bitCast(@select(u32, code == negative_zero_code, negative_zero_bits, unsigned_values));
-        const scaling_factor = e4m3_lut[scale] * inverse_global_scale;
-        const scaling_vector: FloatVector = @splat(scaling_factor);
-        const decoded = values * scaling_vector;
+        const parsed = &self.parsed.?;
+        self.steps = try buildStepsList(self.allocator, &parsed.header);
+        errdefer {
+            self.allocator.free(self.steps);
+            self.steps = &.{};
+        }
 
-        return @bitCast(decoded);
+        self.cache = try self.allocator.alloc(WeightCache, parsed.header.tensors.len);
+        errdefer {
+            self.allocator.free(self.cache);
+            self.cache = &.{};
+        }
+
+        @memset(self.cache, .{});
+
+        self.output_header = try serializeF32Header(self.allocator, parsed, self.steps);
+        errdefer {
+            self.allocator.free(self.output_header);
+            self.output_header = &.{};
+        }
+
+        const pool = try self.allocator.create(Pool);
+        errdefer self.allocator.destroy(pool);
+
+        pool.* = .{};
+        pool.available = .init(&pool.available_block_buffer);
+        pool.decodable = .init(&pool.decodable_block_buffer);
+        pool.decompressed = .init(&pool.decompressed_block_buffer);
+        pool.blocks = try self.allocator.alloc(Block, Pool.total_block_count);
+        errdefer self.allocator.free(pool.blocks);
+        self.pool = pool;
+        errdefer {
+            self.stop();
+            self.pool = null;
+        }
+
+        for (pool.blocks) |*block| {
+            try pool.available.putOne(self.io, block);
+        }
+
+        const n_workers = workerCount();
+        for (0..n_workers) |_| {
+            try self.workers.concurrent(self.io, decodeWorker, .{ self.io, pool });
+            self.workers_started = true;
+        }
+    }
+
+    fn readAndParseHeader(self: *Dequantizer) !safetensors.ParsedHeader {
+        return safetensors.parse(self.allocator, self.input);
+    }
+
+    fn queueAvailableBlocks(self: *Dequantizer) !void {
+        if (self.fill_eof) {
+            return;
+        }
+
+        const pool = self.pool.?;
+        while (true) {
+            var slot: [1]*Block = undefined;
+
+            const n = pool.available.get(self.io, &slot, 0) catch |err| {
+                return pool.queueError(self.io, err);
+            };
+
+            if (n == 0) {
+                return;
+            }
+
+            switch (try self.fillNextBlock(slot[0])) {
+                .eof => {
+                    pool.available.putOne(self.io, slot[0]) catch |err| return pool.queueError(self.io, err);
+                    self.fill_eof = true;
+                    self.closeDecode();
+
+                    return;
+                },
+                .filled => {
+                    self.in_flight += 1;
+                    const block = slot[0];
+
+                    if (block.kind == .dequant) {
+                        pool.decodable.putOne(self.io, block) catch |err| return pool.queueError(self.io, err);
+                    } else {
+                        pool.decompressed.putOne(self.io, block) catch |err| return pool.queueError(self.io, err);
+                    }
+                },
+            }
+        }
+    }
+
+    fn fillNextBlock(self: *Dequantizer, block: *Block) !enum { filled, eof } {
+        while (self.step_index < self.steps.len) {
+            const step = self.steps[self.step_index];
+
+            if (self.current_idx < step.src_start) {
+                self.input.discardAll64(step.src_start - self.current_idx) catch |err| {
+                    if (err == error.EndOfStream) {
+                        return error.TruncatedPayload;
+                    } else {
+                        return err;
+                    }
+                };
+
+                self.current_idx = step.src_start;
+            }
+
+            if (self.step_offset == step.src_len) {
+                self.step_index += 1;
+                self.step_offset = 0;
+
+                continue;
+            }
+
+            const remaining = step.src_len - self.step_offset;
+            switch (step.kind) {
+                .cache_local => {
+                    if (self.cache[self.step_index].local_scales == null) {
+                        self.cache[self.step_index].local_scales = try self.allocator.alloc(u8, @intCast(step.src_len));
+                    }
+
+                    const destination = self.cache[self.step_index].local_scales.?;
+                    const offset: usize = @intCast(self.step_offset);
+
+                    self.input.readSliceAll(destination[offset..][0..@intCast(remaining)]) catch |err| {
+                        if (err == error.EndOfStream) {
+                            return error.TruncatedPayload;
+                        } else {
+                            return err;
+                        }
+                    };
+
+                    self.current_idx += remaining;
+                    self.step_offset = step.src_len;
+
+                    continue;
+                },
+                .cache_global => {
+                    var buf: [4]u8 = undefined;
+
+                    std.debug.assert(step.src_len == 4);
+                    self.input.readSliceAll(buf[0..4]) catch |err| {
+                        if (err == error.EndOfStream) {
+                            return error.TruncatedPayload;
+                        } else {
+                            return err;
+                        }
+                    };
+
+                    try storeGlobalScale(&self.cache[self.step_index], buf);
+
+                    self.current_idx += 4;
+                    self.step_offset = 4;
+
+                    continue;
+                },
+                .copy => {
+                    const n: usize = @intCast(@min(remaining, Block.output_capacity));
+
+                    self.input.readSliceAll(block.output_bytes[0..n]) catch |err| {
+                        if (err == error.EndOfStream) {
+                            return error.TruncatedPayload;
+                        } else {
+                            return err;
+                        }
+                    };
+
+                    block.sequence = self.sequence;
+                    block.output_len = n;
+                    block.packed_len = n;
+                    block.kind = .copy;
+                    self.sequence += 1;
+                    self.current_idx += n;
+                    self.step_offset += n;
+
+                    return .filled;
+                },
+                .dequant => {
+                    const n: usize = @intCast(@min(remaining, Block.packed_capacity));
+                    std.debug.assert(n % nvfp4.packed_size == 0);
+
+                    self.input.readSliceAll(block.packed_bytes[0..n]) catch |err| {
+                        if (err == error.EndOfStream) {
+                            return error.TruncatedPayload;
+                        } else {
+                            return err;
+                        }
+                    };
+
+                    const scale_count = n / nvfp4.packed_size;
+                    const scale_offset: usize = @intCast(self.step_offset / nvfp4.packed_size);
+                    const scales = self.cache[step.scale_index].local_scales orelse return error.MissingCachedScale;
+                    const inv = self.cache[step.global_index].inverse_global_scale orelse return error.MissingCachedScale;
+                    @memcpy(block.scale_bytes[0..scale_count], scales[scale_offset..][0..scale_count]);
+
+                    block.sequence = self.sequence;
+                    block.packed_len = n;
+                    block.output_len = n * 8;
+                    block.inv_scale = inv;
+                    block.kind = .dequant;
+                    self.sequence += 1;
+                    self.current_idx += n;
+                    self.step_offset += n;
+
+                    if (self.step_offset == step.src_len) {
+                        self.allocator.free(scales);
+                        self.cache[step.scale_index].local_scales = null;
+                    }
+
+                    return .filled;
+                },
+            }
+        }
+        return .eof;
     }
 };
 
-pub const Scheme = enum {
-    nvfp4,
-    f32,
+pub const Step = struct {
+    kind: enum { copy, cache_local, cache_global, dequant },
+    src_start: u64,
+    src_len: u64,
+    dst_len: u64,
+    scale_index: u32 = 0,
+    global_index: u32 = 0,
 };
 
-const worker_count: usize = 4;
-const chunks_per_worker: usize = 2;
+pub const WeightCache = struct {
+    local_scales: ?[]u8 = null,
+    inverse_global_scale: ?f32 = null,
+};
 
-const Chunk = struct {
-    const input_capacity: usize = 64 * 1024;
-    const scale_capacity: usize = input_capacity / 8;
-    const output_capacity: usize = input_capacity * 8;
+fn storeGlobalScale(cache: *WeightCache, bytes: [4]u8) !void {
+    const scale: f32 = @bitCast(mem.readInt(u32, &bytes, .little));
 
-    packed_weights: [input_capacity]u8 = undefined,
-    local_scales: [scale_capacity]u8 = undefined,
-    decoded_weights: [output_capacity]u8 align(64) = undefined,
-    sequence: usize = 0,
-    input_len: usize = 0,
+    if (!math.isFinite(scale) or scale <= 0) {
+        return error.InvalidGlobalScale;
+    }
+
+    cache.inverse_global_scale = 1.0 / scale;
+}
+
+fn workerCount() usize {
+    const n = std.Thread.getCpuCount() catch Pool.total_workers;
+    return @max(1, @min(Pool.total_workers, n));
+}
+
+pub const Block = struct {
+    const packed_capacity: usize = 64 * 1024;
+    const scale_capacity: usize = packed_capacity / 8;
+    const output_capacity: usize = packed_capacity * 8;
+
+    packed_bytes: [packed_capacity]u8 = undefined,
+    packed_len: usize = 0,
+
+    scale_bytes: [scale_capacity]u8 = undefined,
+    scale_len: usize = 0,
+
+    output_bytes: [output_capacity]u8 align(64) = undefined,
     output_len: usize = 0,
-    inverse_global_scale: f32 = 0,
+
+    sequence: usize = 0,
+    inv_scale: f32 = 0,
+    kind: enum { copy, dequant } = .copy,
+
+    pub const init: Block = .{};
 };
 
-const Pool = struct {
-    const count: usize = worker_count * chunks_per_worker;
+pub const Pool = struct {
+    pub const total_workers: usize = 4;
+    pub const block_per_workers: usize = 2;
+    pub const total_block_count: usize = total_workers * block_per_workers;
 
-    chunks: []Chunk = &.{},
-    available_buf: [count]*Chunk = undefined,
-    decode_buf: [count]*Chunk = undefined,
-    done_buf: [count]*Chunk = undefined,
-    available: Io.Queue(*Chunk) = undefined,
-    decode: Io.Queue(*Chunk) = undefined,
-    done: Io.Queue(*Chunk) = undefined,
+    blocks: []Block = &.{},
+    available: Io.Queue(*Block) = undefined,
+    available_block_buffer: [total_block_count]*Block = undefined,
+
+    decodable: Io.Queue(*Block) = undefined,
+    decodable_block_buffer: [total_block_count]*Block = undefined,
+
+    decompressed: Io.Queue(*Block) = undefined,
+    decompressed_block_buffer: [total_block_count]*Block = undefined,
+
     error_mutex: Io.Mutex = .init,
-    first_error: ?anyerror = null,
+    maybe_error: ?anyerror = null,
 
-    fn close(self: *Pool, io: Io) void {
+    pub const init: Pool = .{};
+
+    fn close(self: *Pool, io: std.Io) void {
         self.available.close(io);
-        self.decode.close(io);
-        self.done.close(io);
+        self.decodable.close(io);
+        self.decompressed.close(io);
     }
 
-    fn fail(self: *Pool, io: Io, err: anyerror) void {
-        self.error_mutex.lockUncancelable(io);
+    fn fail(self: *Pool, io: std.Io, err: anyerror) void {
+        defer self.close(io);
 
-        if (self.first_error == null) {
-            self.first_error = err;
+        self.error_mutex.lockUncancelable(io);
+        if (self.maybe_error == null) {
+            self.maybe_error = err;
         }
 
         self.error_mutex.unlock(io);
-        self.close(io);
-    }
-
-    fn getError(self: *Pool, io: Io) ?anyerror {
-        self.error_mutex.lockUncancelable(io);
-        defer self.error_mutex.unlock(io);
-        return self.first_error;
-    }
-
-    inline fn takeAvailable(self: *Pool, io: Io) !*Chunk {
-        return self.available.getOne(io) catch |err| {
-            return self.queueError(io, err);
-        };
     }
 
     fn queueError(self: *Pool, io: Io, err: anyerror) anyerror {
@@ -450,11 +595,13 @@ const Pool = struct {
             return err;
         }
     }
-};
 
-const WeightCache = struct {
-    local_scales: ?[]u8 = null,
-    inverse_global_scale: ?f32 = null,
+    fn getError(self: *Pool, io: std.Io) ?anyerror {
+        self.error_mutex.lockUncancelable(io);
+        defer self.error_mutex.unlock(io);
+
+        return self.maybe_error;
+    }
 };
 
 fn closedOrCancel(err: anyerror, io: Io) Io.Cancelable!void {
@@ -467,138 +614,146 @@ fn closedOrCancel(err: anyerror, io: Io) Io.Cancelable!void {
 
 fn decodeWorker(io: Io, pool: *Pool) Io.Cancelable!void {
     while (true) {
-        const chunk = pool.decode.getOne(io) catch |err| {
+        const block = pool.decodable.getOne(io) catch |err| {
             return closedOrCancel(err, io);
         };
 
-        const packed_size = @sizeOf(Nvfp4.PackedWeights);
-        const decoded_size = @sizeOf(Nvfp4.DecodedWeights);
-        const packed_bytes = chunk.packed_weights[0..chunk.input_len];
-        const local_scales = chunk.local_scales[0 .. chunk.input_len / packed_size];
-        const output = chunk.decoded_weights[0..chunk.output_len];
+        nvfp4.decodeBlocks(
+            block.packed_bytes[0..block.packed_len],
+            block.scale_bytes[0 .. block.packed_len / nvfp4.packed_size],
+            block.inv_scale,
+            block.output_bytes[0..block.output_len],
+        );
 
-        std.debug.assert(packed_bytes.len % packed_size == 0);
-        std.debug.assert(local_scales.len == packed_bytes.len / packed_size);
-        std.debug.assert(output.len == local_scales.len * decoded_size);
-
-        for (local_scales, 0..) |local_scale, index| {
-            const decoded = Nvfp4.decodePackedWeights(
-                packed_bytes[index * packed_size ..][0..packed_size].*,
-                local_scale,
-                chunk.inverse_global_scale,
-            );
-
-            const destination = output[index * decoded_size ..][0..decoded_size];
-
-            if (comptime builtin.cpu.arch.endian() == .little) {
-                @memcpy(destination, mem.asBytes(&decoded));
-            } else {
-                for (decoded, 0..) |value, value_index| {
-                    mem.writeInt(
-                        u32,
-                        destination[value_index * 4 ..][0..4],
-                        @bitCast(value),
-                        .little,
-                    );
-                }
-            }
-        }
-
-        pool.done.putOne(io, chunk) catch |err| {
+        pool.decompressed.putOne(io, block) catch |err| {
             return closedOrCancel(err, io);
         };
     }
 }
 
-fn writeWorker(io: Io, writer: *Io.Writer, pool: *Pool) !void {
-    var next: usize = 0;
-    var pending: [Pool.count]?*Chunk = @splat(null);
+fn buildStepsList(allocator: mem.Allocator, header: *const safetensors.Header) ![]Step {
+    const steps = try allocator.alloc(Step, header.tensors.len);
+    errdefer allocator.free(steps);
 
-    while (true) {
-        const chunk = pool.done.getOne(io) catch |err| {
-            switch (err) {
-                error.Closed => break,
-                error.Canceled => return Io.recancel(io),
-            }
+    const names = header.tensors.items(.name);
+    const infos = header.tensors.items(.info);
+
+    for (infos, steps) |info, *step| {
+        const source_length = info.data_offsets[1] - info.data_offsets[0];
+
+        step.* = .{
+            .kind = .copy,
+            .src_start = info.data_offsets[0],
+            .src_len = source_length,
+            .dst_len = source_length,
         };
+    }
 
-        const slot = chunk.sequence % Pool.count;
-        std.debug.assert(pending[slot] == null);
-        pending[slot] = chunk;
+    for (names, 0..) |name, index| {
+        const basename = mem.cutSuffix(u8, name, safetensors.packed_suffix) orelse continue;
+        const local_scale_name = try mem.concat(allocator, u8, &.{ basename, safetensors.local_scale_suffix });
+        defer allocator.free(local_scale_name);
 
-        while (pending[next % Pool.count]) |ready| {
-            std.debug.assert(ready.sequence == next);
+        const global_scale_name = try mem.concat(allocator, u8, &.{ basename, safetensors.global_scale_suffix });
+        defer allocator.free(global_scale_name);
 
-            writer.writeAll(ready.decoded_weights[0..ready.output_len]) catch |err| {
-                pool.fail(io, err);
-                return err;
-            };
+        const local_scale_index = header.tensor_index.get(local_scale_name) orelse return error.MissingLocalScale;
+        const global_scale_index = header.tensor_index.get(global_scale_name) orelse return error.MissingGlobalScale;
 
-            pending[next % Pool.count] = null;
-            next += 1;
+        if (local_scale_index >= index or global_scale_index >= index) {
+            return error.MissingCachedScale;
+        }
 
-            pool.available.putOne(io, ready) catch |err| {
-                switch (err) {
-                    error.Closed => break,
-                    error.Canceled => return Io.recancel(io),
+        if (infos[index].shape.len == 0) {
+            return error.InvalidPackedWeightShape;
+        }
+
+        if (steps[index].src_len % nvfp4.packed_size != 0) {
+            return error.InvalidPackedWeightShape;
+        }
+
+        if (steps[local_scale_index].src_len != steps[index].src_len / nvfp4.packed_size) {
+            return error.InvalidLocalScale;
+        }
+
+        if (steps[global_scale_index].src_len != 4) {
+            return error.InvalidGlobalScale;
+        }
+
+        steps[index].kind = .dequant;
+        steps[index].dst_len = steps[index].src_len * 8;
+        steps[index].scale_index = @intCast(local_scale_index);
+        steps[index].global_index = @intCast(global_scale_index);
+        steps[local_scale_index].kind = .cache_local;
+        steps[global_scale_index].kind = .cache_global;
+    }
+
+    return steps;
+}
+
+fn serializeF32Header(
+    allocator: mem.Allocator,
+    parsed: *const safetensors.ParsedHeader,
+    steps: []const Step,
+) ![]u8 {
+    var arena = heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var allocating: Io.Writer.Allocating = .init(arena_allocator);
+    var stringify: json.Stringify = .{
+        .writer = &allocating.writer,
+        .options = .{},
+    };
+
+    try stringify.beginObject();
+
+    const tensors = parsed.header.tensors.slice();
+    var output_offset: u64 = 0;
+
+    for (steps, 0..) |step, index| {
+        const tensor = tensors.get(index);
+
+        switch (step.kind) {
+            .cache_local, .cache_global => {},
+            .copy => {
+                const output_end = try math.add(u64, output_offset, step.src_len);
+
+                try stringify.objectField(tensor.name);
+                try stringify.write(Tensor.Info{
+                    .dtype = tensor.info.dtype,
+                    .shape = tensor.info.shape,
+                    .data_offsets = .{ output_offset, output_end },
+                });
+
+                output_offset = output_end;
+            },
+            .dequant => {
+                const basename = mem.cutSuffix(u8, tensor.name, safetensors.packed_suffix) orelse return error.InvalidPackedWeightName;
+
+                if (tensor.info.shape.len == 0) {
+                    return error.InvalidPackedWeightShape;
                 }
-            };
+
+                const output_shape = try arena_allocator.dupe(u64, tensor.info.shape);
+                output_shape[output_shape.len - 1] = try math.mul(u64, output_shape[output_shape.len - 1], 2);
+
+                const output_end = try math.add(u64, output_offset, step.dst_len);
+                const output_name = try mem.concat(arena_allocator, u8, &.{ basename, safetensors.weight_suffix });
+
+                try stringify.objectField(output_name);
+                try stringify.write(Tensor.Info{
+                    .dtype = .F32,
+                    .shape = output_shape,
+                    .data_offsets = .{ output_offset, output_end },
+                });
+
+                output_offset = output_end;
+            },
         }
     }
 
-    for (pending) |slot| {
-        if (slot != null) {
-            return pool.getError(io) orelse error.IncompleteOutput;
-        }
-    }
+    try stringify.endObject();
 
-    writer.flush() catch |err| {
-        pool.fail(io, err);
-        return err;
-    };
-}
-
-test "NVFP4 SIMD decode matches every E2M1 code" {
-    const packed_weights: Nvfp4.PackedWeights = .{
-        0x10, 0x32, 0x54, 0x76,
-        0x98, 0xba, 0xdc, 0xfe,
-    };
-
-    const decoded = Nvfp4.decodePackedWeights(packed_weights, 0x40, 1.0);
-
-    for (decoded, Nvfp4.e2m1_lut) |actual, expected_integer| {
-        try std.testing.expectEqual(@as(f32, @floatFromInt(expected_integer)), actual);
-    }
-
-    try std.testing.expectEqual(@as(u32, 0x8000_0000), @as(u32, @bitCast(decoded[8])));
-}
-
-test "NVFP4 applies local and global scales" {
-    const packed_weights: Nvfp4.PackedWeights = @splat(0x11);
-
-    const decoded = Nvfp4.decodePackedWeights(
-        packed_weights,
-        0x48,
-        0.25,
-    );
-
-    for (decoded) |value| {
-        try std.testing.expectEqual(@as(f32, 0.5), value);
-    }
-}
-
-test "E4M3 lookup has expected basic values" {
-    try std.testing.expectEqual(@as(f32, 0), Nvfp4.e4m3_lut[0]);
-    try std.testing.expectEqual(@as(f32, 0), Nvfp4.e4m3_lut[0x7f]);
-    try std.testing.expectEqual(@as(f32, 1), Nvfp4.e4m3_lut[0x40]);
-    try std.testing.expectEqual(@as(f32, 2), Nvfp4.e4m3_lut[0x48]);
-}
-
-test "dequantizer rejects unsupported conversions" {
-    var dequantizer: Dequantizer = undefined;
-
-    try std.testing.expectError(
-        error.UnsupportedConversion,
-        dequantizer.dequantize(.f32, .f32),
-    );
+    return safetensors.serializeHeader(allocator, allocating.writer.buffered());
 }
