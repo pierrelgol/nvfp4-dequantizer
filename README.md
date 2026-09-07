@@ -9,10 +9,8 @@ The input header is parsed and its tensors are classified. A new Safetensors hea
 ## Benchmark
 
 ```text
-safetensor parsing: 349.611us, 67.46875KiB, 188.46 MiB/s
-build output header: 80.176us
-write output header: 151.706us, 38.9140625KiB, 250.50 MiB/s
-dequantize: 181.372ms, 1022.6071701049805MiB, 5638.17 MiB/s
+nvfp4-dequantizer ) ./zig-out/bin/nvfp4_dequantizer models/gemma-3-270m-it-NVFP4/model.safetensors models/gemma-3-270m-it-NVFP4/model.safetensors.f32
+dequantize: 209.463ms, 1022.6451721191406MiB, 4882.22 MiB/s
 ```
 
 ## SIMD dequantization
