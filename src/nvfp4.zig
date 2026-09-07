@@ -141,36 +141,12 @@ pub fn decodeBlocks(packed_bytes: []const u8, scales: []const u8, inverse_global
     std.debug.assert(packed_bytes.len == scales.len * packed_size);
     std.debug.assert(out.len == scales.len * decoded_size);
 
-    var index: usize = 0;
-    while (index + 4 <= scales.len) : (index += 4) {
-        const packed_off = index * packed_size;
-        const out_off = index * decoded_size;
-        if (packed_off + 8 * packed_size <= packed_bytes.len) {
-            @prefetch(packed_bytes.ptr + packed_off + 4 * packed_size, .{
-                .rw = .read,
-                .locality = 3,
-                .cache = .data,
-            });
-        }
-
-        inline for (0..4) |lane| {
-            storeBlock(
-                out[out_off + lane * decoded_size ..][0..decoded_size],
-                decodePackedWeights(
-                    packed_bytes[packed_off + lane * packed_size ..][0..packed_size].*,
-                    scales[index + lane],
-                    inverse_global_scale,
-                ),
-            );
-        }
-    }
-
-    while (index < scales.len) : (index += 1) {
+    for (scales, 0..) |scale, index| {
         storeBlock(
             out[index * decoded_size ..][0..decoded_size],
             decodePackedWeights(
                 packed_bytes[index * packed_size ..][0..packed_size].*,
-                scales[index],
+                scale,
                 inverse_global_scale,
             ),
         );

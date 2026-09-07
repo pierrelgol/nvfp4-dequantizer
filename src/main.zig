@@ -64,7 +64,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         &output_file_writer_buffer,
     );
 
-    var timer = utils.Timer.start("dequantize", io);
     var dequantizer = quantization.Dequantizer.init(
         gpa,
         io,
@@ -73,6 +72,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     );
     defer dequantizer.deinit();
 
+    var timer = utils.Timer.start("dequantize", io);
     const dequantizer_reader = dequantizer.reader();
     const output_bytes = dequantizer_reader.streamRemaining(&output_file_writer.interface) catch |err| {
         if (dequantizer.maybe_err) |detailed_error| {
